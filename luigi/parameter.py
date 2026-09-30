@@ -60,6 +60,7 @@ from luigi import configuration, date_interval, task_register
 from luigi.cmdline_parser import CmdlineParser
 
 from .freezing import FrozenOrderedDict, recursively_freeze, recursively_unfreeze
+from .secret import SecretRef
 
 
 class _NoValueType:
@@ -798,6 +799,47 @@ class StrParameter(Parameter[str]):
 
     def parse(self, x):
         return str(x)
+
+
+class SecretParameter(Parameter[SecretRef]):
+    """
+    Parameter whose value is a reference to a secret, not the secret itself.
+
+    The value is a :class:`~luigi.secret.SecretRef` (a name plus a version),
+    typically written ``name@version``. Only this reference is ever
+    serialized: it is what appears in the task id, the parameter manifest
+    sent to the scheduler, ``repr`` output and error pages. The plaintext
+    is fetched lazily on the worker, at the moment the task actually needs
+    it, by explicitly calling :meth:`~luigi.secret.SecretRef.resolve`::
+
+        class MyTask(luigi.Task):
+            credential = luigi.SecretParameter()
+
+            def run(self):
+                token = self.credential.resolve()  # plaintext exists only here
+
+    Because the reference (including its version) is part of the task id,
+    tasks pointing at different secrets or different versions of the same
+    secret are never merged by the scheduler. If resolution fails, the
+    exception propagates out of the task and nothing is cached, so a retried
+    task re-fetches the plaintext.
+    """
+
+    def parse(self, x):
+        try:
+            return SecretRef.from_str(x)
+        except ValueError as exc:
+            raise ParameterException(str(exc)) from exc
+
+    def serialize(self, x):
+        return str(x)
+
+    def normalize(self, x):
+        if isinstance(x, SecretRef):
+            return x
+        if isinstance(x, str):
+            return self.parse(x)
+        raise ParameterException("Invalid value %r for SecretParameter, expected a 'name@version' string or a SecretRef" % (x,))
 
 
 class IntParameter(Parameter[int]):

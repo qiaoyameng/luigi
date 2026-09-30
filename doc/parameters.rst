@@ -107,6 +107,43 @@ parameters are public, but you can also set them hidden or private.
 
 ``ParameterVisibility.PRIVATE`` - visible only inside task.
 
+Secret parameters
+^^^^^^^^^^^^^^^^^
+
+Access tokens and other secrets should never be passed as ordinary
+parameter values: they would end up in task ids, scheduler state, the web
+UI and error pages. Use :class:`~luigi.parameter.SecretParameter` instead.
+The task only carries a *reference* to the secret (a name plus a version,
+written ``name@version``), and that reference is the only thing that is
+ever serialized or sent to the scheduler.
+
+.. code:: python
+
+    import luigi
+    from luigi.secret import MappingSecretResolver, set_secret_resolver
+
+    # Registered once on the worker, e.g. backed by a vault or KMS.
+    set_secret_resolver(MappingSecretResolver({("db/token", "v1"): "s3cr3t"}))
+
+    class MyTask(luigi.Task):
+        credential = luigi.SecretParameter()
+
+        def run(self):
+            token = self.credential.resolve()  # plaintext exists only here
+
+The reference (including its version) is significant, so tasks pointing at
+different secrets or different versions are never merged by the scheduler.
+The plaintext is fetched lazily on the worker at the moment the task asks
+for it via :meth:`~luigi.secret.SecretRef.resolve`; it is never stored on
+the task, never appears in ``repr`` output or exceptions, and is never
+included in scheduler RPC payloads. If resolution fails, the task fails
+before doing any work, and since nothing is cached, a retried task
+re-fetches the plaintext.
+
+Resolvers implement :class:`~luigi.secret.SecretResolver` and are
+registered with :func:`~luigi.secret.set_secret_resolver`, or passed
+explicitly to ``resolve()``.
+
 Parameter types
 ^^^^^^^^^^^^^^^
 

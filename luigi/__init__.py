@@ -18,7 +18,7 @@
 Package containing core luigi functionality.
 """
 
-from luigi import configuration, event, interface, local_target, parameter, rpc, target, task
+from luigi import configuration, event, interface, local_target, parameter, rpc, secret, target, task
 from luigi.__version__ import VERSION
 from luigi.event import Event
 from luigi.execution_summary import LuigiStatusCode
@@ -55,6 +55,7 @@ from luigi.parameter import (
     OptionalTupleParameter,
     Parameter,
     PathParameter,
+    SecretParameter,
     StrParameter,
     TaskParameter,
     TimeDeltaParameter,
@@ -62,6 +63,14 @@ from luigi.parameter import (
     YearParameter,
 )
 from luigi.rpc import RemoteScheduler, RPCError
+from luigi.secret import (
+    MappingSecretResolver,
+    SecretRef,
+    SecretResolutionError,
+    SecretResolver,
+    get_secret_resolver,
+    set_secret_resolver,
+)
 from luigi.target import Target
 from luigi.task import (
     Config,
@@ -92,6 +101,14 @@ __all__ = [
     "RPCError",
     "parameter",
     "Parameter",
+    "secret",
+    "SecretParameter",
+    "SecretRef",
+    "SecretResolver",
+    "MappingSecretResolver",
+    "SecretResolutionError",
+    "set_secret_resolver",
+    "get_secret_resolver",
     "DateParameter",
     "MonthParameter",
     "YearParameter",
