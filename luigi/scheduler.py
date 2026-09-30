@@ -233,6 +233,7 @@ class Task:
         status,
         deps,
         resources=None,
+        resource_alternatives=None,
         priority=DEFAULT_PRIORITY,
         family="",
         module=None,
@@ -261,6 +262,7 @@ class Task:
         self.expl = None
         self.priority = priority
         self.resources = _get_default(resources, {})
+        self.resource_alternatives = _get_default(resource_alternatives, [])
         self.family = family
         self.module = module
         self.param_visibilities = _get_default(param_visibilities, {})
@@ -396,7 +398,7 @@ class Worker:
         """
         if self.assistant:
             return False
-        return all(not task.resources for task in self.get_tasks(state, PENDING))
+        return all(not task.resources and not getattr(task, "resource_alternatives", None) for task in self.get_tasks(state, PENDING))
 
     @property
     def assistant(self):
@@ -811,6 +813,7 @@ class Scheduler:
         new_deps=None,
         expl=None,
         resources=None,
+        resource_alternatives=None,
         priority=0,
         family="",
         module=None,
@@ -850,6 +853,7 @@ class Scheduler:
                 status=PENDING,
                 deps=deps,
                 resources=resources,
+                resource_alternatives=resource_alternatives,
                 priority=priority,
                 family=family,
                 module=module,
@@ -944,6 +948,9 @@ class Scheduler:
 
         if resources is not None:
             task.resources = resources
+
+        if resource_alternatives is not None:
+            task.resource_alternatives = resource_alternatives
 
         if worker.enabled and not assistant:
             task.stakeholders.add(worker_id)
@@ -1063,6 +1070,30 @@ class Scheduler:
                 return False
         return True
 
+    @staticmethod
+    def _task_resource_options(task):
+        """
+        Return the list of complete resource schemes, any one of which fully
+        satisfies the task. Tasks declaring resource_alternatives get one of
+        those schemes; other tasks get their fixed resources.
+        """
+        alternatives = getattr(task, "resource_alternatives", None)
+        if alternatives:
+            return alternatives
+        return [task.resources]
+
+    def _select_resources(self, task, *used_resources_list):
+        """
+        Return the first of the task's resource schemes that fully fits within
+        all of the given used-resources snapshots, or None if no complete scheme
+        fits. A scheme is selected as a whole; resources from different
+        schemes are never combined.
+        """
+        for option in self._task_resource_options(task):
+            if all(self._has_resources(option, used_resources) for used_resources in used_resources_list):
+                return option
+        return None
+
     def _used_resources(self):
         used_resources = collections.defaultdict(int)
         if self._resources is not None:
@@ -1171,6 +1202,7 @@ class Scheduler:
 
         batched_params, unbatched_params, batched_tasks, max_batch_size = None, None, [], 1
         best_task = None
+        best_task_resources = None
         if current_tasks is not None:
             ct_set = set(current_tasks)
             for task in sorted(self._state.get_active_tasks_by_status(RUNNING), key=self._rank):
@@ -1207,7 +1239,7 @@ class Scheduler:
                 and len(batched_tasks) < max_batch_size
                 and task.is_batchable()
                 and all(task.params.get(name) == value for name, value in unbatched_params.items())
-                and task.resources == best_task.resources
+                and self._task_resource_options(task) == self._task_resource_options(best_task)
                 and self._schedulable(task)
             ):
                 for name, params in batched_params.items():
@@ -1221,10 +1253,12 @@ class Scheduler:
                 for resource, amount in (getattr(task, "resources_running", task.resources) or {}).items():
                     greedy_resources[resource] += amount
 
-            if self._schedulable(task) and self._has_resources(task.resources, greedy_resources):
+            if self._schedulable(task) and self._select_resources(task, greedy_resources) is not None:
                 in_workers = (assistant and task.runnable) or worker_id in task.workers
-                if in_workers and self._has_resources(task.resources, used_resources):
+                chosen_resources = self._select_resources(task, greedy_resources, used_resources) if in_workers else None
+                if chosen_resources is not None:
                     best_task = task
+                    best_task_resources = chosen_resources
                     batch_param_names, max_batch_size = self._state.get_batcher(worker_id, task.family)
                     if batch_param_names and task.is_batchable():
                         try:
@@ -1241,7 +1275,7 @@ class Scheduler:
                             greedy_workers[task_worker] -= 1
 
                             # keep track of the resources used in greedy scheduling
-                            for resource, amount in (task.resources or {}).items():
+                            for resource, amount in (self._task_resource_options(task)[0] or {}).items():
                                 greedy_resources[resource] += amount
 
                             break
@@ -1253,6 +1287,8 @@ class Scheduler:
             batch_id = hashlib.new("md5", batch_string.encode("utf-8"), usedforsecurity=False).hexdigest()
             for task in batched_tasks:
                 self._state.set_batch_running(task, batch_id, worker_id)
+                if best_task_resources is not None:
+                    task.resources_running = best_task_resources.copy()
 
             combined_params = best_task.params.copy()
             combined_params.update(batched_params)
@@ -1263,12 +1299,16 @@ class Scheduler:
             reply["task_params"] = combined_params
             reply["batch_id"] = batch_id
             reply["batch_task_ids"] = [task.id for task in batched_tasks]
+            reply["resources"] = getattr(best_task, "resources_running", None)
 
         elif best_task:
             self.update_metrics_task_started(best_task)
             self._state.set_status(best_task, RUNNING, self._config)
             best_task.worker_running = worker_id
-            best_task.resources_running = best_task.resources.copy()
+            if best_task_resources is not None:
+                best_task.resources_running = best_task_resources.copy()
+            elif getattr(best_task, "resources_running", None) is None:
+                best_task.resources_running = best_task.resources.copy()
             best_task.time_running = time.time()
             self._update_task_history(best_task, RUNNING, host=host)
 
@@ -1276,6 +1316,7 @@ class Scheduler:
             reply["task_family"] = best_task.family
             reply["task_module"] = getattr(best_task, "module", None)
             reply["task_params"] = best_task.params
+            reply["resources"] = best_task.resources_running
 
         else:
             reply["task_id"] = None
@@ -1329,6 +1370,7 @@ class Scheduler:
             "name": task.family,
             "priority": task.priority,
             "resources": task.resources,
+            "resource_alternatives": getattr(task, "resource_alternatives", None),
             "resources_running": getattr(task, "resources_running", None),
             "tracking_url": getattr(task, "tracking_url", None),
             "status_message": getattr(task, "status_message", None),
@@ -1525,8 +1567,9 @@ class Scheduler:
         if self._resources is not None:
             consumers = collections.defaultdict(dict)
             for task in self._state.get_active_tasks_by_status(RUNNING):
-                if task.status == RUNNING and task.resources:
-                    for resource, amount in task.resources.items():
+                running_resources = getattr(task, "resources_running", None) or task.resources
+                if task.status == RUNNING and running_resources:
+                    for resource, amount in running_resources.items():
                         consumers[resource][task.id] = self._serialize_task(task.id, include_deps=False)
             for resource in resources:
                 tasks = consumers[resource["name"]]

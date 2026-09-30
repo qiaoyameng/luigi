@@ -32,7 +32,7 @@ import traceback
 import warnings
 from collections import OrderedDict, deque
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Dict, Optional, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypeAlias, TypeVar
 
 if TYPE_CHECKING:
     from luigi.target import Target
@@ -191,6 +191,19 @@ class Task(metaclass=Register):
     #: Resources used by the task. Should be formatted like {"scp": 1} to indicate that the
     #: task requires 1 unit of the scp resource.
     resources: Dict[str, Any] = {}
+
+    #: Alternative resource schemes, any one of which fully satisfies the task.
+    #: Should be formatted like [{"gpu": 1}, {"cpu": 4}] to indicate that the task
+    #: can run with either 1 gpu or 4 cpu cores. The scheduler picks exactly one
+    #: complete scheme that is fully available; schemes are never mixed. When
+    #: non-empty, this takes precedence over :attr:`resources` for scheduling.
+    resource_alternatives: List[Dict[str, Any]] = []
+
+    #: The resource scheme actually allocated by the scheduler for the current
+    #: run. Set by the worker before the task starts running. For tasks using
+    #: :attr:`resource_alternatives`, this tells the task which scheme was
+    #: chosen. None when the task is not running.
+    resources_running: Optional[Dict[str, Any]] = None
 
     #: Number of seconds after which to time out the run function.
     #: No timeout if set to 0.
@@ -672,6 +685,14 @@ class Task(metaclass=Register):
         the name for consistent end-user experience.
         """
         return self.resources  # default impl
+
+    def process_resource_alternatives(self):
+        """
+        Override in "template" tasks which provide common resource functionality
+        but allow subclasses to specify additional resource alternatives while
+        preserving the name for consistent end-user experience.
+        """
+        return self.resource_alternatives  # default impl
 
     def input(self) -> FlattenableItems["Target"]:
         """

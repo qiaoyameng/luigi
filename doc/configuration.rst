@@ -683,6 +683,19 @@ hive resources and 1 mysql resource:
 Note that it was not necessary to specify the 1 for mysql here, but it
 is good practice to do so when you have a fixed set of resources.
 
+A task that can run with different resource combinations (for example
+either 1 gpu or 4 cpu cores) may declare ``resource_alternatives``, a
+list of complete resource schemes, instead of ``resources``. The
+scheduler picks exactly one scheme that is fully available -- schemes
+are never mixed -- and the actually allocated scheme is passed back to
+the task as ``task.resources_running`` and is the one returned to the
+pool when the task finishes:
+
+.. code:: python
+
+  class MyTask(luigi.Task):
+      resource_alternatives = [{"gpu": 1}, {"cpu": 4}]
+
 .. _retcode-config:
 
 [retcode]

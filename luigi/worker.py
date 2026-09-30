@@ -95,7 +95,9 @@ GetWorkResponse = collections.namedtuple(
         "n_unique_pending",
         "n_pending_last_scheduled",
         "worker_state",
+        "resources",
     ),
+    defaults=[None],
 )
 
 
@@ -906,6 +908,7 @@ class Worker:
             runnable=runnable,
             priority=task.priority,
             resources=task.process_resources(),
+            resource_alternatives=task.process_resource_alternatives(),
             params=task.to_str_params(),
             family=task.task_family,
             module=task.task_module,
@@ -1021,15 +1024,20 @@ class Worker:
             #  That is you can user a newer client than server (Sep 2016)
             n_pending_last_scheduled=r.get("n_pending_last_scheduled", 0),
             worker_state=r.get("worker_state", WORKER_STATE_ACTIVE),
+            resources=r.get("resources"),
         )
 
-    def _run_task(self, task_id):
+    def _run_task(self, task_id, resources_running=None):
         if task_id in self._running_tasks:
             logger.debug("Got already running task id {} from scheduler, taking a break".format(task_id))
             next(self._sleeper())
             return
 
         task = self._scheduled_tasks[task_id]
+
+        if resources_running is not None:
+            # tell the task which of its resource schemes the scheduler allocated
+            task.resources_running = resources_running
 
         task_process = self._create_task_process(task)
 
@@ -1238,7 +1246,7 @@ class Worker:
 
             # task_id is not None:
             logger.debug("Pending tasks: %s", get_work_response.n_pending_tasks)
-            self._run_task(get_work_response.task_id)
+            self._run_task(get_work_response.task_id, resources_running=get_work_response.resources)
 
         while len(self._running_tasks):
             logger.debug("Shut down Worker, %d more tasks to go", len(self._running_tasks))
