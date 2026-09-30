@@ -24,6 +24,7 @@ from helpers import unittest
 
 import luigi.notifications
 from luigi.scheduler import BATCH_RUNNING, DISABLED, DONE, FAILED, PENDING, RUNNING, UNKNOWN, UPSTREAM_RUNNING, Scheduler
+from luigi import task_status
 
 luigi.notifications.DEBUG = True
 WORKER = "myworker"
@@ -451,6 +452,168 @@ class SchedulerApiTest(unittest.TestCase):
         self._start_simple_batch()
         self.sch.add_task(worker=WORKER, task_id="A_1_2", status=DONE)
         self.assertEqual({"A_1", "A_2", "A_1_2"}, set(self.sch.task_list(DONE, "").keys()))
+
+    def _start_per_member_batch(self, num=3):
+        self.sch.add_task_batcher(worker=WORKER, task_family="A", batched_args=["a"])
+        for index in range(num):
+            self.sch.add_task(
+                worker=WORKER,
+                task_id="A_{}".format(index),
+                family="A",
+                params={"a": str(index)},
+                batchable=True,
+            )
+        response = self.sch.get_work(worker=WORKER)
+        batch_id = response["batch_id"]
+        member_ids = response["batch_task_ids"]
+        self.sch.add_task(
+            worker=WORKER,
+            task_id="PARENT",
+            task_family="A",
+            params=response["task_params"],
+            batch_id=batch_id,
+            status=RUNNING,
+            per_member_batch_results=True,
+        )
+        return batch_id, member_ids
+
+    def test_per_member_results_partial_outcomes(self):
+        batch_id, member_ids = self._start_per_member_batch()
+
+        response = self.sch.add_batch_member_results(
+            worker=WORKER,
+            batch_id=batch_id,
+            member_results={
+                member_ids[0]: task_status.MEMBER_DONE,
+                member_ids[1]: task_status.MEMBER_FAILED,
+                member_ids[2]: task_status.MEMBER_NOT_PROCESSED,
+            },
+        )
+        self.assertEqual(1, response["done"])
+        self.assertEqual(1, response["failed"])
+        self.assertEqual(1, response["not_processed"])
+        self.assertEqual([], response["invalid_member_ids"])
+
+        statuses = {task["status"] for task in self.sch.task_list("", "").values()}
+        self.assertIn(DONE, statuses)
+        self.assertIn(FAILED, statuses)
+        self.assertIn(PENDING, statuses)
+
+    def test_per_member_results_reschedules_only_unprocessed(self):
+        batch_id, member_ids = self._start_per_member_batch()
+        self.sch.add_batch_member_results(
+            worker=WORKER,
+            batch_id=batch_id,
+            member_results={
+                member_ids[0]: task_status.MEMBER_DONE,
+                member_ids[1]: task_status.MEMBER_FAILED,
+                member_ids[2]: task_status.MEMBER_NOT_PROCESSED,
+            },
+        )
+        # finalize the combined task successfully
+        self.sch.add_task(worker=WORKER, task_id="PARENT", status=DONE)
+
+        # While the not-processed cooldown is active, nothing is rescheduled
+        self.assertIsNone(self.sch.get_work(worker=WORKER)["task_id"])
+
+        self.setTime(self.time() + 200)
+        work = self.sch.get_work(worker=WORKER)
+        # Only the not-processed member is picked up (single-item batch ->
+        # plain task), never the already DONE member.
+        self.assertEqual(member_ids[2], work["task_id"])
+        self.assertNotIn("batch_task_ids", work)
+
+    def test_per_member_results_reject_unknown_ids(self):
+        batch_id, member_ids = self._start_per_member_batch()
+        response = self.sch.add_batch_member_results(
+            worker=WORKER,
+            batch_id=batch_id,
+            member_results={
+                member_ids[0]: task_status.MEMBER_DONE,
+                "DOES_NOT_EXIST": task_status.MEMBER_DONE,
+            },
+        )
+        self.assertEqual(["DOES_NOT_EXIST"], response["invalid_member_ids"])
+        self.assertEqual(1, response["done"])
+        # Unreported members must not silently succeed when the parent finishes
+        self.sch.add_task(worker=WORKER, task_id="PARENT", status=DONE)
+        done_ids = set(self.sch.task_list(DONE, ""))
+        self.assertNotIn(member_ids[1], done_ids)
+        self.assertNotIn(member_ids[2], done_ids)
+
+    def test_per_member_results_reject_bad_status(self):
+        batch_id, member_ids = self._start_per_member_batch()
+        response = self.sch.add_batch_member_results(
+            worker=WORKER,
+            batch_id=batch_id,
+            member_results={member_ids[0]: "MAYBE"},
+        )
+        self.assertEqual([member_ids[0]], response["invalid_statuses"])
+        self.assertEqual(0, response["done"])
+        self.assertEqual(set(member_ids), set(self.sch.task_list(BATCH_RUNNING, "")))
+
+    def test_per_member_results_reject_duplicates(self):
+        batch_id, member_ids = self._start_per_member_batch()
+        first = self.sch.add_batch_member_results(
+            worker=WORKER,
+            batch_id=batch_id,
+            member_results={member_ids[0]: task_status.MEMBER_DONE},
+        )
+        self.assertEqual(0, len(first["duplicates"]))
+        second = self.sch.add_batch_member_results(
+            worker=WORKER,
+            batch_id=batch_id,
+            member_results={member_ids[0]: task_status.MEMBER_FAILED},
+        )
+        self.assertEqual([member_ids[0]], second["duplicates"])
+        self.assertEqual(0, second["failed"])
+        # Original outcome wins
+        self.assertEqual(DONE, self.sch.task_list("", "")[member_ids[0]]["status"])
+
+    def test_per_member_results_payload_is_json_serializable(self):
+        import json
+
+        batch_id, member_ids = self._start_per_member_batch()
+        payload = {
+            "worker": WORKER,
+            "batch_id": batch_id,
+            "member_results": {member_ids[0]: task_status.MEMBER_DONE},
+        }
+        result = self.sch.add_batch_member_results(**json.loads(json.dumps(payload)))
+        self.assertEqual(1, result["done"])
+        self.assertEqual(json.loads(json.dumps(result)), result)
+
+    def test_per_member_missing_report_not_all_success(self):
+        batch_id, member_ids = self._start_per_member_batch()
+        # Only one of three members reported
+        self.sch.add_batch_member_results(
+            worker=WORKER,
+            batch_id=batch_id,
+            member_results={member_ids[0]: task_status.MEMBER_DONE},
+        )
+        self.sch.add_task(worker=WORKER, task_id="PARENT", status=DONE)
+        statuses = {task_id: task["status"] for task_id, task in self.sch.task_list("", "").items()}
+        self.assertEqual(DONE, statuses[member_ids[0]])
+        # Unreported members are sent back to PENDING, not marked DONE
+        self.assertEqual(PENDING, statuses[member_ids[1]])
+        self.assertEqual(PENDING, statuses[member_ids[2]])
+
+    def test_per_member_batch_worker_crash_fails_all(self):
+        batch_id, member_ids = self._start_per_member_batch()
+        # One member reported DONE before the worker dies
+        self.sch.add_batch_member_results(
+            worker=WORKER,
+            batch_id=batch_id,
+            member_results={member_ids[0]: task_status.MEMBER_DONE},
+        )
+        self.setTime(self.time() + 100)
+        self.sch.prune()
+        statuses = {task_id: task["status"] for task_id, task in self.sch.task_list("", "").items()}
+        # The reported member keeps its success; everything unreported fails
+        # following the original dead-worker recovery rule.
+        self.assertEqual(DONE, statuses[member_ids[0]])
+        self.assertEqual(FAILED, statuses[member_ids[1]])
+        self.assertEqual(FAILED, statuses[member_ids[2]])
 
     def test_reschedule_max_batch(self):
         self.sch.add_task_batcher(worker=WORKER, task_family="A", batched_args=["a"])

@@ -41,7 +41,18 @@ from luigi.batch_notifier import BatchNotifier
 from luigi.metrics import MetricsCollectors
 from luigi.parameter import ParameterVisibility
 from luigi.task import Config
-from luigi.task_status import BATCH_RUNNING, DISABLED, DONE, FAILED, PENDING, RUNNING, SUSPENDED, UNKNOWN
+from luigi.task_status import (
+    BATCH_MEMBER_STATUSES,
+    BATCH_RUNNING,
+    DISABLED,
+    DONE,
+    FAILED,
+    MEMBER_NOT_PROCESSED,
+    PENDING,
+    RUNNING,
+    SUSPENDED,
+    UNKNOWN,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +291,11 @@ class Task:
         self.runnable = False
         self.batchable = False
         self.batch_id = None
+        # True while this (parent) batch run reports results per member
+        self.per_member_batch_results = False
+        # Timestamp until which a not-processed batch member waits before
+        # becoming schedulable again (None otherwise)
+        self.not_processed_until = None
 
     def __repr__(self):
         return "Task(%r)" % vars(self)
@@ -441,6 +457,10 @@ class SimpleTaskState:
         self._status_tasks = collections.defaultdict(dict)
         self._active_workers = {}  # map from id to a Worker object
         self._task_batchers = {}
+        # batch id -> tuple of all member task ids handed out in that batch
+        self._batch_members = {}
+        # batch id -> set of member ids that got an explicit per-member result
+        self._batch_reported_members = {}
         self._metrics_collector = None
 
     def get_state(self):
@@ -494,6 +514,22 @@ class SimpleTaskState:
         assert batch_id is not None
         return [task for task in self.get_active_tasks_by_status(BATCH_RUNNING) if task.batch_id == batch_id]
 
+    def set_batch_members(self, batch_id, task_ids):
+        self._batch_members[batch_id] = tuple(task_ids)
+
+    def get_batch_members(self, batch_id):
+        return self._batch_members.get(batch_id, ())
+
+    def mark_batch_member_reported(self, batch_id, task_id):
+        self._batch_reported_members.setdefault(batch_id, set()).add(task_id)
+
+    def batch_member_was_reported(self, batch_id, task_id):
+        return task_id in self._batch_reported_members.get(batch_id, set())
+
+    def get_batch_unreported_members(self, batch_id):
+        reported = self._batch_reported_members.get(batch_id, set())
+        return [task_id for task_id in self.get_batch_members(batch_id) if task_id not in reported]
+
     def set_batcher(self, worker_id, family, batcher_args, max_batch_size):
         self._task_batchers.setdefault(worker_id, {})
         self._task_batchers[worker_id][family] = (batcher_args, max_batch_size)
@@ -530,6 +566,7 @@ class SimpleTaskState:
         task.batch_id = batch_id
         task.worker_running = worker_id
         task.resources_running = task.resources
+        task.not_processed_until = None
         task.time_running = time.time()
 
     def set_status(self, task, new_status, config=None):
@@ -550,9 +587,31 @@ class SimpleTaskState:
                 return
 
         if task.status == RUNNING and task.batch_id is not None and new_status != RUNNING:
-            for batch_task in self.get_batch_running_tasks(task.batch_id):
-                self.set_status(batch_task, new_status, config)
-                batch_task.batch_id = None
+            unreported_ids = self.get_batch_unreported_members(task.batch_id)
+            if task.per_member_batch_results and unreported_ids:
+                # Per-member protocol. Members already reported through
+                # add_batch_member_results() have left BATCH_RUNNING and keep
+                # their own DONE/FAILED/PENDING outcome. Anything still
+                # unreported is resent as PENDING when the combined task
+                # finished normally, but inherits the FAILED outcome when the
+                # run raised or the worker crashed (original recovery rule).
+                unreported_status = PENDING if new_status == DONE else new_status
+                for member_id in unreported_ids:
+                    batch_task = self.get_task(member_id)
+                    if batch_task is None:
+                        continue
+                    self.set_status(batch_task, unreported_status, config)
+                    batch_task.worker_running = None
+                    if unreported_status == PENDING and config is not None:
+                        batch_task.not_processed_until = time.time() + config.retry_delay
+                    batch_task.batch_id = None
+            else:
+                # Legacy all-or-nothing batching (or every member of a
+                # per-member batch was already reported): remaining members
+                # inherit the outcome of the combined task.
+                for batch_task in self.get_batch_running_tasks(task.batch_id):
+                    self.set_status(batch_task, new_status, config)
+                    batch_task.batch_id = None
             task.batch_id = None
 
         if new_status == FAILED and task.status != DISABLED:
@@ -736,6 +795,19 @@ class Scheduler:
         assistant_ids = {w.id for w in self._state.get_assistants()}
         remove_tasks = []
 
+        # Fail disconnected batch parents first so the all-or-nothing cascade
+        # marks every member FAILED at once, regardless of dict iteration
+        # order. This preserves the original crash recovery rule.
+        dead_batch_parent_ids = [
+            task.id
+            for task in self._state.get_active_tasks_by_status(RUNNING)
+            if task.batch_id is not None
+            and task.worker_running
+            and task.worker_running not in task.stakeholders | assistant_ids
+        ]
+        for task_id in dead_batch_parent_ids:
+            self._state.fail_dead_worker_task(self._state.get_task(task_id), self._config, assistant_ids)
+
         for task in self._state.get_active_tasks():
             self._state.fail_dead_worker_task(task, self._config, assistant_ids)
             self._state.update_status(task, self._config)
@@ -822,6 +894,7 @@ class Scheduler:
         worker=None,
         batchable=None,
         batch_id=None,
+        per_member_batch_results=None,
         retry_policy_dict=None,
         owners=None,
         **kwargs,
@@ -900,6 +973,9 @@ class Scheduler:
         if batchable is not None:
             task.batchable = batchable
 
+        if per_member_batch_results is not None:
+            task.per_member_batch_results = per_member_batch_results
+
         if task.remove is not None:
             task.remove = None  # unmark task for removal so it isn't removed after being added
 
@@ -976,6 +1052,107 @@ class Scheduler:
         else:
             unbatched_params = params
         self._email_batcher.add_scheduling_fail(task_name, family, unbatched_params, expl, owners)
+
+    @rpc_method()
+    def add_batch_member_results(self, worker, batch_id, member_results, member_expls=None, **kwargs):
+        """
+        Report the per-member outcome of a finished batch run.
+
+        ``member_results`` maps batch member task ids to one of the statuses in
+        :data:`luigi.task_status.BATCH_MEMBER_STATUSES`:
+
+        * ``DONE``: the member succeeded and must never run again.
+        * ``FAILED``: the member failed on this attempt and follows the usual
+          retry / disable accounting.
+        * ``NOT_PROCESSED``: the worker did not get to this member; it goes
+          back to PENDING and is rescheduled.
+
+        Unknown member ids, unknown statuses and duplicate reports for members
+        that have already left BATCH_RUNNING are rejected and counted in the
+        response instead of being applied. Members the worker fails to report
+        at all stay BATCH_RUNNING until the parent task is finalized, at which
+        point they are reset to PENDING (or FAILED if the worker died), so a
+        partial or malformed report can never turn the whole batch into a
+        success.
+        """
+        assert worker is not None
+        worker_id = worker
+        self._update_worker(worker_id)
+
+        member_results = dict(member_results or {})
+        member_expls = dict(member_expls or {})
+
+        all_member_ids = set(self._state.get_batch_members(batch_id))
+
+        invalid_ids = []
+        invalid_statuses = []
+        duplicates = []
+        done = failed = not_processed = 0
+        for member_id, member_status in member_results.items():
+            if member_id not in all_member_ids:
+                invalid_ids.append(member_id)
+                continue
+            if member_status not in BATCH_MEMBER_STATUSES:
+                invalid_statuses.append(member_id)
+                continue
+            if self._state.batch_member_was_reported(batch_id, member_id):
+                # Duplicate result for a member that was already reported
+                duplicates.append(member_id)
+                continue
+            self._state.mark_batch_member_reported(batch_id, member_id)
+
+            member = self._state.get_task(member_id)
+
+            expl = member_expls.get(member_id)
+            if expl is not None:
+                member.expl = expl
+
+            if member_status == DONE:
+                self._update_task_history(member, DONE)
+                self._state.set_status(member, DONE, self._config)
+                member.batch_id = None
+                member.retry = None
+                member.not_processed_until = None
+                done += 1
+            elif member_status == MEMBER_NOT_PROCESSED:
+                self._state.set_status(member, PENDING, self._config)
+                member.batch_id = None
+                member.worker_running = None
+                # Same retry window as a failed attempt; the member becomes
+                # schedulable again on the next scheduling pass instead of
+                # being re-batched instantly by the same finishing worker.
+                member.not_processed_until = time.time() + self._config.retry_delay
+                not_processed += 1
+            else:  # FAILED
+                self._update_task_history(member, FAILED)
+                self._state.set_status(member, FAILED, self._config)
+                member.batch_id = None
+                failed += 1
+
+                if self._config.batch_emails:
+                    batched_params, _ = self._state.get_batcher(worker_id, member.family)
+                    unbatched_params = (
+                        {param: value for param, value in member.params.items() if param not in batched_params}
+                        if batched_params
+                        else member.params
+                    )
+                    try:
+                        expl_raw = json.loads(expl) if expl else expl
+                    except (ValueError, TypeError):
+                        expl_raw = expl
+                    self._email_batcher.add_failure(member.pretty_id, member.family, unbatched_params, expl_raw, kwargs.get("owners"))
+                    if member.status == DISABLED:
+                        self._email_batcher.add_disable(member.pretty_id, member.family, unbatched_params, kwargs.get("owners"))
+
+        return {
+            "batch_id": batch_id,
+            "done": done,
+            "failed": failed,
+            "not_processed": not_processed,
+            "invalid_member_ids": invalid_ids,
+            "invalid_statuses": invalid_statuses,
+            "duplicates": duplicates,
+        }
 
     @rpc_method()
     def add_worker(self, worker, info, **kwargs):
@@ -1084,6 +1261,9 @@ class Scheduler:
 
     def _schedulable(self, task):
         if task.status != PENDING:
+            return False
+        if task.not_processed_until is not None and task.not_processed_until > time.time():
+            # Waiting out the not-processed batch member cooldown
             return False
         for dep in task.deps:
             dep_task = self._state.get_task(dep, default=None)
@@ -1253,6 +1433,7 @@ class Scheduler:
             batch_id = hashlib.new("md5", batch_string.encode("utf-8"), usedforsecurity=False).hexdigest()
             for task in batched_tasks:
                 self._state.set_batch_running(task, batch_id, worker_id)
+            self._state.set_batch_members(batch_id, [task.id for task in batched_tasks])
 
             combined_params = best_task.params.copy()
             combined_params.update(batched_params)

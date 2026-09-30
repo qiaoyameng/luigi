@@ -200,6 +200,12 @@ class Task(metaclass=Register):
     #: Maximum number of tasks to run together as a batch. Infinite by default
     max_batch_size = float("inf")
 
+    #: When True, a batched run may finish partially: ``run()`` reports the
+    #: outcome (succeeded, failed or not processed) of every batch member via
+    #: :meth:`get_batch_member_results`. Only members that are still not
+    #: processed are rescheduled.
+    per_member_batch_results = False
+
     @property
     def batchable(self):
         """
@@ -207,6 +213,28 @@ class Task(metaclass=Register):
         if it has any batched parameters
         """
         return bool(self.batch_param_names())
+
+    def get_batch_member_results(self):
+        """
+        Return the per-member outcome of a batched ``run()``.
+
+        Only called for batchable tasks with
+        :attr:`per_member_batch_results` enabled. It must return a mapping
+        ``{member_index: status}`` with exactly one entry per member that was
+        part of the batch. ``member_index`` is the zero-based position of the
+        member in the batch (matching the order of the combined batched
+        parameter values handed to the task by the scheduler) and ``status`` is
+        one of
+        :data:`luigi.task_status.MEMBER_DONE`,
+        :data:`luigi.task_status.MEMBER_FAILED` or
+        :data:`luigi.task_status.MEMBER_NOT_PROCESSED`.
+
+        Missing or extra members are not accepted: every batch member has to
+        be reported exactly once.
+        """
+        raise NotImplementedError(
+            "Tasks with per_member_batch_results=True must implement get_batch_member_results()"
+        )
 
     @property
     def retry_count(self):

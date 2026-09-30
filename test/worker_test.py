@@ -37,6 +37,7 @@ from luigi.cmdline import luigi_run
 from luigi.mock import MockFileSystem, MockTarget
 from luigi.rpc import RPCError
 from luigi.scheduler import Scheduler
+from luigi import task_status
 from luigi.worker import Worker
 
 luigi.notifications.DEBUG = True
@@ -937,6 +938,140 @@ class WorkerTest(LuigiTestCase):
         failed_ids = set(self.sch.task_list("FAILED", ""))
         self.assertEqual({task.task_id for task in tasks}, failed_ids)
         self.assertTrue(all(self.sch.fetch_error(task_id)["error"] for task_id in failed_ids))
+
+    def test_per_member_batch_results_partial_success(self):
+        processed = set()
+        batch_number = [0]
+        run_batches = []
+
+        class PartialBatchJob(luigi.Task):
+            value = luigi.parameter.Parameter(batch_method=",".join)
+            per_member_batch_results = True
+
+            def run(self):
+                members = self.value.split(",")
+                run_batches.append(list(members))
+                batch_number[0] += 1
+                results = {}
+                for index, member in enumerate(members):
+                    if member == "ok":
+                        processed.add(member)
+                        results[index] = task_status.MEMBER_DONE
+                    elif member == "fail":
+                        results[index] = task_status.MEMBER_FAILED
+                    elif batch_number[0] == 1:
+                        results[index] = task_status.MEMBER_NOT_PROCESSED
+                    else:
+                        processed.add(member)
+                        results[index] = task_status.MEMBER_DONE
+                self._results = results
+
+            def get_batch_member_results(self):
+                return self._results
+
+            def complete(self):
+                return self.value in processed
+
+        tasks = [PartialBatchJob("ok"), PartialBatchJob("fail"), PartialBatchJob("skip")]
+        task_ids = {task.value: task.task_id for task in tasks}
+
+        for task in tasks:
+            self.assertTrue(self.w.add(task))
+        self.assertFalse(self.w.run())
+
+        self.assertEqual(run_batches, [["ok", "fail", "skip"]])
+        statuses = {task_id: state["status"] for task_id, state in self.sch.task_list("", "").items()}
+        self.assertEqual(task_status.DONE, statuses[task_ids["ok"]])
+        self.assertEqual(task_status.FAILED, statuses[task_ids["fail"]])
+        self.assertEqual(task_status.PENDING, statuses[task_ids["skip"]])
+
+        # Trigger another scheduling pass once the retry/not-processed
+        # cooldown is over. The failed and not-processed members come back
+        # (the former fails again), but the already successful member must
+        # never run again.
+        self.setTime(time.time() + 200)
+        run_batches = []
+        with Worker(scheduler=self.sch, worker_id="Z") as w3:
+            for task in tasks:
+                self.assertTrue(w3.add(task))
+            self.assertFalse(w3.run())
+
+        executed_members = {member for batch in run_batches for member in batch}
+        self.assertNotIn("ok", executed_members)
+        self.assertIn("skip", executed_members)
+        statuses = {task_id: state["status"] for task_id, state in self.sch.task_list("", "").items()}
+        self.assertEqual(task_status.DONE, statuses[task_ids["ok"]])
+        self.assertEqual(task_status.FAILED, statuses[task_ids["fail"]])
+        self.assertEqual(task_status.DONE, statuses[task_ids["skip"]])
+        self.assertEqual(processed, {"ok", "skip"})
+
+    def test_per_member_batch_results_missing_report_is_not_all_success(self):
+        processed = set()
+
+        class IncompleteReportBatchJob(luigi.Task):
+            value = luigi.parameter.Parameter(batch_method=",".join)
+            per_member_batch_results = True
+
+            def run(self):
+                members = self.value.split(",")
+                processed.update(members)
+                # Buggy report: only the first member is reported
+                self._results = {0: task_status.MEMBER_DONE}
+
+            def get_batch_member_results(self):
+                return self._results
+
+            def complete(self):
+                return set(self.value.split(",")).issubset(processed)
+
+        tasks = [IncompleteReportBatchJob("a"), IncompleteReportBatchJob("b")]
+        for task in tasks:
+            self.assertTrue(self.w.add(task))
+        self.assertFalse(self.w.run())
+
+        statuses = {task_id: state["status"] for task_id, state in self.sch.task_list("", "").items()}
+        member_statuses = {statuses[task.task_id] for task in tasks}
+        # The malformed report is rejected as a task failure; members are not DONE
+        self.assertNotIn(task_status.DONE, member_statuses)
+
+    def test_per_member_batch_results_invalid_status_is_not_all_success(self):
+        class BadStatusBatchJob(luigi.Task):
+            value = luigi.parameter.Parameter(batch_method=",".join)
+            per_member_batch_results = True
+
+            def run(self):
+                self._results = {index: "MAYBE" for index in range(len(self.value.split(",")))}
+
+            def get_batch_member_results(self):
+                return self._results
+
+            def complete(self):
+                return False
+
+        tasks = [BadStatusBatchJob("a"), BadStatusBatchJob("b")]
+        for task in tasks:
+            self.assertTrue(self.w.add(task))
+        self.assertFalse(self.w.run())
+        self.assertEqual({task.task_id for task in tasks}, set(self.sch.task_list("FAILED", "")))
+
+    def test_legacy_batch_still_all_or_nothing(self):
+        completed = set()
+
+        class LegacyBatchJob(luigi.Task):
+            value = luigi.parameter.Parameter(batch_method=",".join)
+
+            def run(self):
+                completed.update(self.value.split(","))
+
+            def complete(self):
+                return all(member in completed for member in self.value.split(","))
+
+        tasks = [LegacyBatchJob("1"), LegacyBatchJob("2"), LegacyBatchJob("3")]
+        for task in tasks:
+            self.assertTrue(self.w.add(task))
+        self.assertTrue(self.w.run())
+        done_ids = set(self.sch.task_list("DONE", ""))
+        self.assertTrue({task.task_id for task in tasks}.issubset(done_ids))
 
 
 class WorkerKeepAliveTests(LuigiTestCase):

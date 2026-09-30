@@ -56,7 +56,7 @@ from luigi.scheduler import DISABLED, DONE, FAILED, PENDING, UNKNOWN, WORKER_STA
 from luigi.target import Target
 from luigi.task import Config, DynamicRequirements, Task, flatten
 from luigi.task_register import TaskClassException, load_task
-from luigi.task_status import RUNNING
+from luigi.task_status import BATCH_MEMBER_STATUSES, RUNNING
 
 logger = logging.getLogger("luigi-interface")
 
@@ -125,6 +125,7 @@ class TaskProcess(multiprocessing.Process):
         check_unfulfilled_deps=True,
         check_complete_on_run=False,
         task_completion_cache=None,
+        num_batch_members=0,
     ):
         super(TaskProcess, self).__init__()
         self.task = task
@@ -137,6 +138,8 @@ class TaskProcess(multiprocessing.Process):
         self.check_unfulfilled_deps = check_unfulfilled_deps
         self.check_complete_on_run = check_complete_on_run
         self.task_completion_cache = task_completion_cache
+        # Number of members in this (combined) batch run, 0 for regular tasks
+        self.num_batch_members = num_batch_members
 
         # completeness check using the cache
         self.check_complete = functools.partial(check_complete_cached, completion_cache=task_completion_cache)
@@ -182,6 +185,7 @@ class TaskProcess(multiprocessing.Process):
         expl = ""
         missing = []
         new_deps = []
+        member_results = None
         try:
             # Verify that all the tasks are fulfilled! For external tasks we
             # don't care about unfulfilled dependencies, because we are just
@@ -229,6 +233,7 @@ class TaskProcess(multiprocessing.Process):
             if new_deps:
                 logger.info("[pid %s] Worker %s new requirements      %s", os.getpid(), self.worker_id, self.task)
             elif status == DONE:
+                member_results = self._get_batch_member_results()
                 self.task.trigger_event(Event.PROCESSING_TIME, self.task, time.time() - t0)
                 expl = self.task.on_success()
                 logger.info("[pid %s] Worker %s done      %s", os.getpid(), self.worker_id, self.task)
@@ -241,7 +246,31 @@ class TaskProcess(multiprocessing.Process):
             expl = self._handle_run_exception(ex)
 
         finally:
-            self.result_queue.put((self.task.task_id, status, expl, missing, new_deps))
+            self.result_queue.put((self.task.task_id, status, expl, missing, new_deps, member_results))
+
+    def _get_batch_member_results(self):
+        """
+        Collect per-member outcomes from a batch task that opted in.
+
+        Returns None for ordinary (non-batch or legacy) tasks. Bad results
+        (missing members, unknown indices/statuses or non-mapping return
+        values) surface as a task failure so they can never be accepted as a
+        fully successful batch.
+        """
+        if not getattr(self.task, "per_member_batch_results", False):
+            return None
+        if not self.num_batch_members:
+            return None
+        num_members = self.num_batch_members
+
+        reported = self.task.get_batch_member_results()
+        if not isinstance(reported, collections.abc.Mapping) or set(reported) != set(range(num_members)):
+            raise TaskException(
+                "get_batch_member_results() must return a status for every member index 0..{}".format(num_members - 1)
+            )
+        if any(status not in BATCH_MEMBER_STATUSES for status in reported.values()):
+            raise TaskException("Batch member statuses must be one of {}".format(sorted(BATCH_MEMBER_STATUSES)))
+        return {index: reported[index] for index in range(num_members)}
 
     def _handle_run_exception(self, ex):
         logger.exception("[pid %s] Worker %s failed    %s", os.getpid(), self.worker_id, self.task)
@@ -569,6 +598,8 @@ class Worker:
         self._suspended_tasks = {}
         self._batch_running_tasks = {}
         self._batch_families_sent = set()
+        # combined task id -> {"batch_id": str, "members": [member task ids]}
+        self._batch_member_info = {}
 
         self._first_task = None
 
@@ -613,9 +644,15 @@ class Worker:
             self._add_task_history.append((task, status, runnable))
             kwargs["owners"] = task._owner_list()
 
+        member_statuses = None
         if task_id in self._batch_running_tasks:
-            for batch_task in self._batch_running_tasks.pop(task_id):
-                self._add_task_history.append((batch_task, status, True))
+            batch_tasks = self._batch_running_tasks.pop(task_id)
+            batch_info = self._batch_member_info.pop(task_id, None)
+            if batch_info is not None and "member_statuses" in batch_info:
+                member_statuses = batch_info.pop("member_statuses")
+            for batch_task in batch_tasks:
+                member_status = member_statuses.get(batch_task.task_id) if member_statuses is not None else status
+                self._add_task_history.append((batch_task, member_status, True))
 
         if task and kwargs.get("params"):
             kwargs["param_visibilities"] = task._get_param_visibilities()
@@ -966,7 +1003,12 @@ class Worker:
                 params=task.to_str_params(),
                 status=RUNNING,
                 batch_id=get_work_response["batch_id"],
+                per_member_batch_results=getattr(task, "per_member_batch_results", False),
             )
+            self._batch_member_info[task.task_id] = {
+                "batch_id": get_work_response["batch_id"],
+                "members": list(get_work_response["batch_task_ids"]),
+            }
             return task.task_id
         else:
             return None
@@ -1009,7 +1051,7 @@ class Worker:
                 self.run_succeeded = False
 
         if task_id is not None and "batch_task_ids" in r:
-            batch_tasks = filter(None, [self._scheduled_tasks.get(batch_id) for batch_id in r["batch_task_ids"]])
+            batch_tasks = list(filter(None, [self._scheduled_tasks.get(member_id) for member_id in r["batch_task_ids"]]))
             self._batch_running_tasks[task_id] = batch_tasks
 
         return GetWorkResponse(
@@ -1046,6 +1088,8 @@ class Worker:
         message_queue = multiprocessing.Queue() if task.accepts_messages else None
         reporter = TaskStatusReporter(self._scheduler, task.task_id, self._id, message_queue)
         use_multiprocessing = self._config.force_multiprocessing or bool(self.worker_processes > 1)
+        batch_info = self._batch_member_info.get(task.task_id)
+        num_batch_members = len(batch_info["members"]) if batch_info is not None else 0
         return ContextManagedTaskProcess(
             self._config.task_process_context,
             task,
@@ -1057,6 +1101,7 @@ class Worker:
             check_unfulfilled_deps=self._config.check_unfulfilled_deps,
             check_complete_on_run=self._config.check_complete_on_run,
             task_completion_cache=self._task_completion_cache,
+            num_batch_members=num_batch_members,
         )
 
     def _purge_children(self):
@@ -1077,7 +1122,7 @@ class Worker:
                 continue
 
             logger.info(error_msg)
-            self._task_result_queue.put((task_id, FAILED, error_msg, [], []))
+            self._task_result_queue.put((task_id, FAILED, error_msg, [], [], None))
 
     def _handle_next_task(self):
         """
@@ -1093,7 +1138,7 @@ class Worker:
             self._purge_children()  # Deal with subprocess failures
 
             try:
-                task_id, status, expl, missing, new_requirements = self._task_result_queue.get(timeout=self._config.wait_interval)
+                task_id, status, expl, missing, new_requirements, member_results = self._task_result_queue.get(timeout=self._config.wait_interval)
             except Queue.Empty:
                 return
 
@@ -1114,6 +1159,8 @@ class Worker:
                 for t in new_req:
                     self.add(t)
                 new_deps = [t.task_id for t in new_req]
+
+            member_statuses = self._report_batch_member_results(task_id, status, expl, member_results)
 
             self._add_task(
                 worker=self._id,
@@ -1146,6 +1193,46 @@ class Worker:
 
             self.run_succeeded &= (status == DONE) or (len(new_deps) > 0)
             return
+
+    def _report_batch_member_results(self, task_id, status, expl, member_results):
+        """
+        Forward per-member outcomes to the scheduler before the combined task
+        is finalized. Returns a {member_task_id: status} mapping for the
+        execution summary, or None for non per-member batches.
+        """
+        batch_info = self._batch_member_info.get(task_id)
+        if batch_info is None or member_results is None:
+            return None
+
+        member_ids = batch_info["members"]
+        results_by_id = {}
+        expls_by_id = {}
+        member_statuses = {}
+        # expl from the run describes the failed member(s); attach it to the
+        # failed ones so fetch_error keeps working for them.
+        serialized_expl = json.dumps(expl) if expl else None
+        for index, member_id in enumerate(member_ids):
+            member_status = member_results[index]
+            results_by_id[member_id] = member_status
+            member_statuses[member_id] = member_status
+            if member_status == FAILED and serialized_expl is not None:
+                expls_by_id[member_id] = serialized_expl
+
+        response = self._scheduler.add_batch_member_results(
+            worker=self._id,
+            batch_id=batch_info["batch_id"],
+            member_results=results_by_id,
+            member_expls=expls_by_id,
+        )
+        if response.get("invalid_member_ids") or response.get("invalid_statuses") or response.get("duplicates"):
+            logger.warning("Scheduler rejected batch member results: %s", response)
+
+        batch_info["member_statuses"] = member_statuses
+        if status == DONE and (response["failed"] > 0 or response["not_processed"] > 0):
+            # A batch run that left members failed or unprocessed is not a
+            # fully successful run; the next scheduling pass picks them up.
+            self.run_succeeded = False
+        return member_statuses
 
     def _sleeper(self):
         # TODO is exponential backoff necessary?

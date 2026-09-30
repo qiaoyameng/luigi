@@ -181,6 +181,49 @@ task that ends up running will use resources. The scheduler only checks
 that there are sufficient resources for each task individually before
 batching them all together.
 
+Reporting per-member results
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+By default a batch is all-or-nothing: every member inherits the final
+status of the combined task. If a single run can process members
+independently, set ``per_member_batch_results = True`` and implement
+``get_batch_member_results()`` to report the outcome of each member:
+
+.. code-block:: python
+
+    from luigi import task_status
+
+    class A(luigi.Task):
+        date = luigi.DateParameter(batch_method=max)
+
+        per_member_batch_results = True
+
+        def run(self):
+            # process each member independently, remember the outcome
+            ...
+
+        def get_batch_member_results(self):
+            # keys are zero-based member positions in scheduler order
+            return {
+                0: task_status.MEMBER_DONE,
+                1: task_status.MEMBER_FAILED,
+                2: task_status.MEMBER_NOT_PROCESSED,
+            }
+
+The three outcomes are:
+
+- ``MEMBER_DONE``: the member succeeded and is never scheduled again.
+- ``MEMBER_FAILED``: the member failed and follows the ordinary
+  retry/disable accounting.
+- ``MEMBER_NOT_PROCESSED``: the run did not get to this member; it is
+  sent back to ``PENDING`` and picked up by a later scheduling pass.
+
+Every member must be reported exactly once. Unknown member ids, unknown
+status values, duplicate reports and missing members are rejected; a
+partial or malformed report can never make the whole batch look
+successful. If the batch worker crashes before finalizing, members still
+follow the original recovery rule and are marked as failed.
+
 Tasks that regularly overwrite the same data source
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

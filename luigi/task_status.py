@@ -26,3 +26,11 @@ BATCH_RUNNING = "BATCH_RUNNING"
 SUSPENDED = "SUSPENDED"  # Only kept for backward compatibility with old clients
 UNKNOWN = "UNKNOWN"
 DISABLED = "DISABLED"
+
+# Per-member outcomes reported by a batch run (see :ref:`batch_method`)
+MEMBER_DONE = DONE
+MEMBER_FAILED = FAILED
+MEMBER_NOT_PROCESSED = "NOT_PROCESSED"
+
+# Status values a batch worker may report for an individual batch member
+BATCH_MEMBER_STATUSES = frozenset((MEMBER_DONE, MEMBER_FAILED, MEMBER_NOT_PROCESSED))
