@@ -233,6 +233,7 @@ class Task:
         status,
         deps,
         resources=None,
+        alternative_resources=None,
         priority=DEFAULT_PRIORITY,
         family="",
         module=None,
@@ -261,6 +262,15 @@ class Task:
         self.expl = None
         self.priority = priority
         self.resources = _get_default(resources, {})
+        # Each entry is a complete, self-contained resource plan. The task can
+        # run under any one of them, but never a mix of several plans.
+        self.alternative_resources = [plan.copy() for plan in _get_default(alternative_resources, ())]
+        # The plan that the scheduler selected when the task was started.
+        # ``None`` while the task is still PENDING.
+        self.assigned_resources = None
+        self.assigned_resources_index = None
+        # Kept for backwards compatibility and to mirror ``resources`` once running.
+        self.resources_running = None
         self.family = family
         self.module = module
         self.param_visibilities = _get_default(param_visibilities, {})
@@ -300,6 +310,48 @@ class Task:
             return self.batchable
         except AttributeError:
             return False
+
+    def resource_plans(self):
+        """
+        Return all complete resource plans the task can run under.
+
+        The primary ``resources`` dict is always the first plan, followed by
+        every entry of ``alternative_resources`` in declaration order.
+        """
+        plans = [self.resources]
+        plans.extend(getattr(self, "alternative_resources", None) or ())
+        return plans
+
+    def pick_resource_plan(self, fits):
+        """
+        Return the index and contents of the first complete plan that fits.
+
+        ``fits`` is called with a resource dict and must return whether the
+        plan is fully available. Plans are evaluated atomically and in
+        declaration order, resources are never combined across plans.
+        Return ``(None, None)`` if no single plan fits.
+        """
+        for index, plan in enumerate(self.resource_plans()):
+            if fits(plan):
+                return index, plan.copy()
+        return None, None
+
+    def assign_resource_plan(self, index, plan):
+        """Record the complete plan the scheduler handed out for this run."""
+        self.assigned_resources_index = index
+        self.assigned_resources = plan.copy()
+        self.resources_running = plan.copy()
+
+    def clear_resource_plan(self):
+        """End the current assignment once the run has finished or failed.
+
+        ``resources_running`` is kept as a record of what the last run held
+        (only RUNNING/BATCH_RUNNING tasks are counted as using resources), but
+        the active assignment markers are cleared so a later retry can pick
+        any plan again.
+        """
+        self.assigned_resources_index = None
+        self.assigned_resources = None
 
     def add_failure(self):
         """
@@ -396,7 +448,7 @@ class Worker:
         """
         if self.assistant:
             return False
-        return all(not task.resources for task in self.get_tasks(state, PENDING))
+        return all(not task.resources and not getattr(task, "alternative_resources", None) for task in self.get_tasks(state, PENDING))
 
     @property
     def assistant(self):
@@ -525,11 +577,15 @@ class SimpleTaskState:
             self.set_status(task, FAILED, config)
             task.clear_failures()
 
-    def set_batch_running(self, task, batch_id, worker_id):
+    def set_batch_running(self, task, batch_id, worker_id, assigned_resources=None):
         self.set_status(task, BATCH_RUNNING)
         task.batch_id = batch_id
         task.worker_running = worker_id
-        task.resources_running = task.resources
+        if assigned_resources is not None:
+            task.assigned_resources = assigned_resources.copy()
+            task.resources_running = assigned_resources.copy()
+        else:
+            task.resources_running = task.resources
         task.time_running = time.time()
 
     def set_status(self, task, new_status, config=None):
@@ -574,10 +630,16 @@ class SimpleTaskState:
             task.scheduler_disable_time = None
 
         if new_status != task.status:
-            self._status_tasks[task.status].pop(task.id)
+            old_status = task.status
+            self._status_tasks[old_status].pop(task.id)
             self._status_tasks[new_status][task.id] = task
             task.status = new_status
             task.updated = time.time()
+            # Resources are handed back to the pool as soon as the task stops
+            # running, so the plan chosen for this run is forgotten. A later
+            # retry is free to pick any plan again.
+            if old_status in (RUNNING, BATCH_RUNNING) and new_status not in (RUNNING, BATCH_RUNNING):
+                task.clear_resource_plan()
             self.update_metrics(task, config)
 
         if new_status == FAILED:
@@ -811,6 +873,7 @@ class Scheduler:
         new_deps=None,
         expl=None,
         resources=None,
+        alternative_resources=None,
         priority=0,
         family="",
         module=None,
@@ -838,6 +901,7 @@ class Scheduler:
         worker = self._update_worker(worker_id)
 
         resources = {} if resources is None else resources.copy()
+        alternative_resources = [] if alternative_resources is None else [plan.copy() for plan in alternative_resources]
 
         if retry_policy_dict is None:
             retry_policy_dict = {}
@@ -850,6 +914,7 @@ class Scheduler:
                 status=PENDING,
                 deps=deps,
                 resources=resources,
+                alternative_resources=alternative_resources,
                 priority=priority,
                 family=family,
                 module=module,
@@ -886,6 +951,8 @@ class Scheduler:
                 # copy resources_running of the first batch task
                 batch_tasks = self._state.get_batch_running_tasks(batch_id)
                 task.resources_running = batch_tasks[0].resources_running.copy()
+                task.assigned_resources = batch_tasks[0].assigned_resources.copy() if batch_tasks[0].assigned_resources else None
+                task.assigned_resources_index = batch_tasks[0].assigned_resources_index
             task.time_running = time.time()
 
         if accepts_messages is not None:
@@ -943,7 +1010,11 @@ class Scheduler:
             task.deps.update(new_deps)
 
         if resources is not None:
-            task.resources = resources
+            # Never overwrite the declaration of a task that is currently
+            # running, its resources are already locked in for this run.
+            if task.status not in (RUNNING, BATCH_RUNNING):
+                task.resources = resources
+                task.alternative_resources = alternative_resources
 
         if worker.enabled and not assistant:
             task.stakeholders.add(worker_id)
@@ -1171,6 +1242,8 @@ class Scheduler:
 
         batched_params, unbatched_params, batched_tasks, max_batch_size = None, None, [], 1
         best_task = None
+        best_plan = None
+        best_plan_index = None
         if current_tasks is not None:
             ct_set = set(current_tasks)
             for task in sorted(self._state.get_active_tasks_by_status(RUNNING), key=self._rank):
@@ -1218,13 +1291,31 @@ class Scheduler:
 
             if task.status == RUNNING and (task.worker_running in greedy_workers):
                 greedy_workers[task.worker_running] -= 1
-                for resource, amount in (getattr(task, "resources_running", task.resources) or {}).items():
+                running_plan = getattr(task, "resources_running", None) or task.resources
+                for resource, amount in running_plan.items():
                     greedy_resources[resource] += amount
 
-            if self._schedulable(task) and self._has_resources(task.resources, greedy_resources):
+            if self._schedulable(task):
+                # Choose a complete plan against the resources that would be
+                # left in a greedy rescheduling of the active workers.
+                _, greedy_plan = task.pick_resource_plan(lambda plan: self._has_resources(plan, greedy_resources))
+            else:
+                greedy_plan = None
+
+            if greedy_plan is not None:
+                # The currently available resources can only be a subset of the
+                # greedy view, so a different plan might be the first one that
+                # fits. Select independently, the task always gets one whole plan.
+                running_index, running_plan = task.pick_resource_plan(lambda plan: self._has_resources(plan, used_resources))
+            else:
+                running_index, running_plan = None, None
+
+            if greedy_plan is not None:
                 in_workers = (assistant and task.runnable) or worker_id in task.workers
-                if in_workers and self._has_resources(task.resources, used_resources):
+                if in_workers and running_plan is not None:
                     best_task = task
+                    best_plan_index = running_index
+                    best_plan = running_plan
                     batch_param_names, max_batch_size = self._state.get_batcher(worker_id, task.family)
                     if batch_param_names and task.is_batchable():
                         try:
@@ -1241,18 +1332,25 @@ class Scheduler:
                             greedy_workers[task_worker] -= 1
 
                             # keep track of the resources used in greedy scheduling
-                            for resource, amount in (task.resources or {}).items():
+                            for resource, amount in greedy_plan.items():
                                 greedy_resources[resource] += amount
 
                             break
 
         reply = self.count_pending(worker_id)
 
+        if best_task is not None and best_plan is None:
+            # best_task was already running (eg. a batch runner that needs to
+            # be resent to this worker); keep using the plan assigned to it.
+            best_plan = getattr(best_task, "resources_running", None) or best_task.resources
+            best_plan_index = getattr(best_task, "assigned_resources_index", None)
+
         if len(batched_tasks) > 1:
             batch_string = "|".join(task.id for task in batched_tasks)
             batch_id = hashlib.new("md5", batch_string.encode("utf-8"), usedforsecurity=False).hexdigest()
             for task in batched_tasks:
-                self._state.set_batch_running(task, batch_id, worker_id)
+                self._state.set_batch_running(task, batch_id, worker_id, assigned_resources=best_plan)
+                task.assigned_resources_index = best_plan_index
 
             combined_params = best_task.params.copy()
             combined_params.update(batched_params)
@@ -1261,6 +1359,8 @@ class Scheduler:
             reply["task_family"] = best_task.family
             reply["task_module"] = getattr(best_task, "module", None)
             reply["task_params"] = combined_params
+            reply["assigned_resources"] = best_plan
+            reply["assigned_resources_index"] = best_plan_index
             reply["batch_id"] = batch_id
             reply["batch_task_ids"] = [task.id for task in batched_tasks]
 
@@ -1268,7 +1368,7 @@ class Scheduler:
             self.update_metrics_task_started(best_task)
             self._state.set_status(best_task, RUNNING, self._config)
             best_task.worker_running = worker_id
-            best_task.resources_running = best_task.resources.copy()
+            best_task.assign_resource_plan(best_plan_index, best_plan)
             best_task.time_running = time.time()
             self._update_task_history(best_task, RUNNING, host=host)
 
@@ -1276,6 +1376,8 @@ class Scheduler:
             reply["task_family"] = best_task.family
             reply["task_module"] = getattr(best_task, "module", None)
             reply["task_params"] = best_task.params
+            reply["assigned_resources"] = best_task.assigned_resources
+            reply["assigned_resources_index"] = best_task.assigned_resources_index
 
         else:
             reply["task_id"] = None
@@ -1329,7 +1431,10 @@ class Scheduler:
             "name": task.family,
             "priority": task.priority,
             "resources": task.resources,
+            "alternative_resources": getattr(task, "alternative_resources", []),
             "resources_running": getattr(task, "resources_running", None),
+            "assigned_resources": getattr(task, "assigned_resources", None),
+            "assigned_resources_index": getattr(task, "assigned_resources_index", None),
             "tracking_url": getattr(task, "tracking_url", None),
             "status_message": getattr(task, "status_message", None),
             "progress_percentage": getattr(task, "progress_percentage", None),
@@ -1627,9 +1732,18 @@ class Scheduler:
             if task.status != RUNNING:
                 return
 
+            assigned = getattr(task, "assigned_resources", None)
+
             def decrease(resources, decrease_resources):
                 for resource, decrease_amount in decrease_resources.items():
-                    if decrease_amount > 0 and resource in resources:
+                    # Only resources of the plan the task actually runs under
+                    # may be reduced. This keeps a reduction from silently
+                    # turning the task into one of its other plans.
+                    if (
+                        decrease_amount > 0
+                        and resource in resources
+                        and (assigned is None or resource in assigned)
+                    ):
                         resources[resource] = max(0, resources[resource] - decrease_amount)
 
             decrease(task.resources_running, decrease_resources)
@@ -1637,11 +1751,18 @@ class Scheduler:
                 for batch_task in self._state.get_batch_running_tasks(task.batch_id):
                     decrease(batch_task.resources_running, decrease_resources)
 
+            return {"taskId": task_id, "resources": getattr(task, "resources_running", None)}
+
     @rpc_method()
     def get_running_task_resources(self, task_id):
         if self._state.has_task(task_id):
             task = self._state.get_task(task_id)
-            return {"taskId": task_id, "resources": getattr(task, "resources_running", None)}
+            return {
+                "taskId": task_id,
+                "resources": getattr(task, "resources_running", None),
+                "assigned_resources": getattr(task, "assigned_resources", None),
+                "assigned_resources_index": getattr(task, "assigned_resources_index", None),
+            }
         else:
             return {"taskId": task_id, "resources": None}
 

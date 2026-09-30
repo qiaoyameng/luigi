@@ -32,7 +32,7 @@ import traceback
 import warnings
 from collections import OrderedDict, deque
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Dict, Optional, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypeAlias, TypeVar
 
 if TYPE_CHECKING:
     from luigi.target import Target
@@ -191,6 +191,23 @@ class Task(metaclass=Register):
     #: Resources used by the task. Should be formatted like {"scp": 1} to indicate that the
     #: task requires 1 unit of the scp resource.
     resources: Dict[str, Any] = {}
+
+    #: Alternative, complete resource plans this task can run under. Every entry
+    #: is a self-contained resource dict, like ``[{"cpu": 4}]``. The scheduler
+    #: picks at most one complete plan (either ``resources`` or one entry of
+    #: ``alternative_resources``); resources are never combined across plans.
+    #: The plan that was actually selected is available on
+    #: :attr:`assigned_resources` while the task is running.
+    alternative_resources: List[Dict[str, Any]] = []
+
+    #: The complete resource plan the scheduler selected for the current run.
+    #: ``None`` before the task is started, otherwise equal to one of the plans
+    #: declared in :attr:`resources` / :attr:`alternative_resources`.
+    assigned_resources: Optional[Dict[str, Any]] = None
+
+    #: Index of the selected plan, 0 being :attr:`resources`, 1 the first entry
+    #: of :attr:`alternative_resources`, and so on.
+    assigned_resources_index: Optional[int] = None
 
     #: Number of seconds after which to time out the run function.
     #: No timeout if set to 0.
@@ -672,6 +689,15 @@ class Task(metaclass=Register):
         the name for consistent end-user experience.
         """
         return self.resources  # default impl
+
+    def process_alternative_resources(self):
+        """
+        Alternative complete resource plans, mirroring :meth:`process_resources`.
+
+        Override in "template" tasks which let subclasses extend the
+        :attr:`alternative_resources` declaration.
+        """
+        return self.alternative_resources  # default impl
 
     def input(self) -> FlattenableItems["Target"]:
         """

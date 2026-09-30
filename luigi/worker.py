@@ -906,6 +906,7 @@ class Worker:
             runnable=runnable,
             priority=task.priority,
             resources=task.process_resources(),
+            alternative_resources=task.process_alternative_resources(),
             params=task.to_str_params(),
             family=task.task_family,
             module=task.task_module,
@@ -1011,6 +1012,18 @@ class Worker:
         if task_id is not None and "batch_task_ids" in r:
             batch_tasks = filter(None, [self._scheduled_tasks.get(batch_id) for batch_id in r["batch_task_ids"]])
             self._batch_running_tasks[task_id] = batch_tasks
+
+        if task_id is not None and r.get("assigned_resources") is not None:
+            # The scheduler picked one complete resource plan for this run.
+            # Hand it to every task instance involved, including batch tasks.
+            assigned_resources = r["assigned_resources"]
+            assigned_resources_index = r.get("assigned_resources_index")
+            scheduled_ids = r.get("batch_task_ids") or [task_id]
+            for scheduled_id in scheduled_ids:
+                scheduled_task = self._scheduled_tasks.get(scheduled_id)
+                if scheduled_task is not None:
+                    scheduled_task.assigned_resources = assigned_resources
+                    scheduled_task.assigned_resources_index = assigned_resources_index
 
         return GetWorkResponse(
             task_id=task_id,
@@ -1121,6 +1134,7 @@ class Worker:
                 status=status,
                 expl=json.dumps(expl),
                 resources=task.process_resources(),
+                alternative_resources=task.process_alternative_resources(),
                 runnable=None,
                 params=task.to_str_params(),
                 family=task.task_family,

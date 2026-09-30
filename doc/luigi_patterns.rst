@@ -253,6 +253,52 @@ scheduled.
             # continue with reduced resources
             ...
 
+Alternative resource plans
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Some tasks can be executed in more than one way, each way consuming a
+different set of resources. For example a task might either use one GPU or
+four CPU cores. In addition to :attr:`~luigi.Task.resources`, which always
+describes the preferred plan, declare the alternatives as
+:attr:`~luigi.Task.alternative_resources`, a list of complete, self-contained
+resource dicts:
+
+.. code-block:: python
+
+    class TrainModel(luigi.Task):
+
+        # preferred plan
+        resources = {"gpu": 1}
+
+        # alternative, complete plans
+        alternative_resources = [{"cpu": 4}]
+
+When the task is ready, the scheduler tries the plans in declaration order
+(``resources`` first, then each entry of ``alternative_resources``) and
+starts the task under the first plan that is fully available. A plan is
+always chosen as a whole: if only some resources of every plan are free, the
+task waits instead of combining parts of different plans. Priorities and all
+existing resource limits still apply, and resources are released according to
+the plan that was actually assigned.
+
+The selected plan is handed back to the task while it is running as
+:attr:`~luigi.Task.assigned_resources` (a dict) and
+:attr:`~luigi.Task.assigned_resources_index` (0 for ``resources``, 1 for the
+first alternative, and so on):
+
+.. code-block:: python
+
+        def run(self):
+            if self.assigned_resources_index == 0:
+                run_on_gpu()
+            else:
+                run_on_cpu()
+
+Decreasing resources of a running task (see
+:meth:`~luigi.Task.decrease_running_resources`) only applies to resources
+that belong to the plan the task is actually running under; it can not be
+used to turn the task into one of its other plans.
+
 Monitoring task pipelines
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
