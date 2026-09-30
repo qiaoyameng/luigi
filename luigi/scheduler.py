@@ -280,6 +280,9 @@ class Task:
         self.runnable = False
         self.batchable = False
         self.batch_id = None
+        # named stage states reported by workers, maps stage name to a record
+        # with keys "fingerprint", "deps", "status" and "updated"
+        self.stages = {}
 
     def __repr__(self):
         return "Task(%r)" % vars(self)
@@ -1276,6 +1279,9 @@ class Scheduler:
             reply["task_family"] = best_task.family
             reply["task_module"] = getattr(best_task, "module", None)
             reply["task_params"] = best_task.params
+            # hand the recorded named stage states back to the worker so a
+            # resumed task can tell which stages already completed
+            reply["stage_states"] = getattr(best_task, "stages", {})
 
         else:
             reply["task_id"] = None
@@ -1333,6 +1339,7 @@ class Scheduler:
             "tracking_url": getattr(task, "tracking_url", None),
             "status_message": getattr(task, "status_message", None),
             "progress_percentage": getattr(task, "progress_percentage", None),
+            "stages": getattr(task, "stages", {}),
         }
         if task.status == DISABLED:
             ret["re_enable_able"] = task.scheduler_disable_time is not None
@@ -1594,6 +1601,52 @@ class Scheduler:
             if task.status == RUNNING and task.batch_id is not None:
                 for batch_task in self._state.get_batch_running_tasks(task.batch_id):
                     batch_task.status_message = status_message
+
+    @rpc_method()
+    def update_task_stage(self, task_id, stage_name, fingerprint, deps=None, status=PENDING, worker=None):
+        """
+        Record the state of a named stage of a task.
+
+        The stage is identified by its name and the *fingerprint* of its
+        dependency set. If the fingerprint of an already recorded stage does
+        not match (e.g. the task code changed and now yields a different set
+        of dependencies for the same stage name), the old record is discarded
+        so that the new dependencies are never mistaken for the completed
+        stage. A completed stage is never regressed back to a non-complete
+        status for the same fingerprint.
+        """
+        if not self._state.has_task(task_id):
+            return
+        task = self._state.get_task(task_id)
+        if not hasattr(task, "stages"):
+            # tasks restored from an old state dump may lack the attribute
+            task.stages = {}
+
+        existing = task.stages.get(stage_name)
+        if existing and existing.get("fingerprint") != fingerprint:
+            logger.info(
+                "Stage %r of task %s changed its dependencies, resetting recorded stage state",
+                stage_name,
+                task_id,
+            )
+        elif existing and existing.get("status") == DONE and status != DONE:
+            # never regress a completed stage with identical dependencies
+            return
+
+        task.stages[stage_name] = {
+            "fingerprint": fingerprint,
+            "deps": sorted(deps or []),
+            "status": status,
+            "updated": time.time(),
+        }
+
+    @rpc_method()
+    def get_task_stages(self, task_id):
+        if self._state.has_task(task_id):
+            task = self._state.get_task(task_id)
+            return {"taskId": task_id, "stages": getattr(task, "stages", {})}
+        else:
+            return {"taskId": task_id, "stages": {}}
 
     @rpc_method()
     def get_task_status_message(self, task_id):

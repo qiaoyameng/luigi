@@ -54,9 +54,9 @@ from luigi.event import Event
 from luigi.parameter import BoolParameter, FloatParameter, IntParameter, OptionalParameter, Parameter, TimeDeltaParameter
 from luigi.scheduler import DISABLED, DONE, FAILED, PENDING, UNKNOWN, WORKER_STATE_ACTIVE, WORKER_STATE_DISABLED, RetryPolicy, Scheduler
 from luigi.target import Target
-from luigi.task import Config, DynamicRequirements, Task, flatten
+from luigi.task import Config, DynamicRequirements, Stage, Task, flatten
 from luigi.task_register import TaskClassException, load_task
-from luigi.task_status import RUNNING
+from luigi.task_status import DONE, PENDING, RUNNING
 
 logger = logging.getLogger("luigi-interface")
 
@@ -163,11 +163,26 @@ class TaskProcess(multiprocessing.Process):
 
             if not requires.complete(self.check_complete):
                 # not all requirements are complete, return them which adds them to the tree
+                if isinstance(requires, Stage):
+                    self._report_stage(requires, PENDING)
                 new_deps = [(t.task_module, t.task_family, t.to_str_params()) for t in requires.flat_requirements]
                 return new_deps
 
+            if isinstance(requires, Stage):
+                self._report_stage(requires, DONE)
+
             # get the next generator result
             next_send = requires.paths
+
+    def _report_stage(self, stage, status):
+        if self.status_reporter is None:
+            return
+        self.status_reporter.report_task_stage(
+            stage_name=stage.name,
+            fingerprint=stage.fingerprint,
+            deps=[t.task_id for t in stage.flat_requirements],
+            status=status,
+        )
 
     def run(self):
         logger.info("[pid %s] Worker %s running   %s", os.getpid(), self.worker_id, self.task)
@@ -337,6 +352,16 @@ class TaskStatusReporter:
 
     def report_task_statistics(self, statistics):
         self._scheduler.report_task_statistics(self._task_id, statistics)
+
+    def report_task_stage(self, stage_name, fingerprint, deps, status):
+        self._scheduler.update_task_stage(
+            task_id=self._task_id,
+            worker=self._worker_id,
+            stage_name=stage_name,
+            fingerprint=fingerprint,
+            deps=deps,
+            status=status,
+        )
 
 
 class SchedulerMessage:
@@ -1007,6 +1032,12 @@ class Worker:
                 self._handle_task_load_error(ex, [task_id])
                 task_id = None
                 self.run_succeeded = False
+
+        if task_id is not None:
+            # hand the named stage states recorded by the scheduler back to
+            # the task, so a resumed task can tell which stages (same name
+            # and same dependencies) already completed
+            self._scheduled_tasks[task_id]._completed_stages = r.get("stage_states") or {}
 
         if task_id is not None and "batch_task_ids" in r:
             batch_tasks = filter(None, [self._scheduled_tasks.get(batch_id) for batch_id in r["batch_task_ids"]])

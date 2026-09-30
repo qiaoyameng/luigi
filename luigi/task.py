@@ -693,6 +693,51 @@ class Task(metaclass=Register):
         # used by scheduler
         return flatten(self._requires())
 
+    @property
+    def completed_stages(self) -> Dict[str, Any]:
+        """
+        Stage states reported back by the scheduler for this task.
+
+        Maps stage name to a record with the dependency ``fingerprint``,
+        the ``status`` and the ``deps`` of the stage as they were when the
+        stage state was recorded. Empty unless the worker injected states
+        before running this task (see :py:class:`luigi.worker.Worker`).
+        """
+        return getattr(self, "_completed_stages", None) or {}
+
+    def stage(self, name, requirements, custom_complete=None) -> "Stage":
+        """
+        Create a named :py:class:`Stage` to be yielded from ``run()``.
+
+        Yielding a stage works like yielding dynamic requirements, except
+        that the scheduler keeps track of the stage name, its dependency
+        identity and its completion status. When a task is resumed (e.g.
+        after the worker running it exited), :py:attr:`Stage.already_complete`
+        tells whether this exact stage (same name *and* same dependencies)
+        was already completed, so that external work does not have to be
+        repeated. Example:
+
+        .. code-block:: python
+
+            class MyTask(luigi.Task):
+
+                def run(self):
+                    extract = self.stage("extract", [ExtractJobDone(...)])
+                    if not extract.already_complete:
+                        self.submit_external_extract_job()  # not repeated on resume
+                    to_load = yield extract
+
+                    load = self.stage("load", [LoadJobDone(...)])
+                    if not load.already_complete:
+                        self.submit_external_load_job(to_load)
+                    yield load
+
+        Note that a completed stage does not imply that the task itself is
+        complete: the task status is still decided by ``output()``/
+        ``complete()`` as usual.
+        """
+        return Stage(name, requirements, custom_complete=custom_complete, task=self)
+
     def run(self):
         """
         The task run method, to be overridden in a subclass.
@@ -856,6 +901,75 @@ class DynamicRequirements(object):
 
         # default implementation
         return all(complete_fn(t) for t in self.flat_requirements)
+
+
+def stage_dependency_fingerprint(requirements) -> str:
+    """
+    Compute a stable identity fingerprint for the dependency set of a stage.
+
+    The fingerprint only depends on the task ids of the (flattened)
+    requirements, so replaying a stage with the same name but a different
+    set of dependencies (e.g. after a code change) yields a different
+    fingerprint and will not be mistaken for the completed stage.
+    """
+    task_ids = sorted(task.task_id for task in flatten(requirements))
+    return hashlib.md5("|".join(task_ids).encode("utf-8"), usedforsecurity=False).hexdigest()
+
+
+class Stage(DynamicRequirements):
+    """
+    A named set of dynamic requirements yielded from a task's ``run()`` method.
+
+    Behaves like :py:class:`DynamicRequirements`, but additionally carries a
+    *name* so that the scheduler can persist the completion status of the
+    stage together with the identity (fingerprint) of its dependencies. When
+    the task is resumed later (possibly by a different worker), the scheduler
+    hands the recorded stage states back to the task and
+    :py:attr:`already_complete` tells whether this stage -- same name and same
+    dependencies -- has already been completed. This allows multi-stage tasks
+    to skip external work that was already submitted before an interruption.
+
+    Stages are usually created through :py:meth:`Task.stage`.
+
+    .. py:attribute:: name
+
+        The name of the stage. Must be unique within the task's ``run()``.
+
+    .. py:attribute:: already_complete
+
+        Whether the scheduler has recorded this exact stage (same name and
+        same dependency fingerprint) as completed. A stage with a matching
+        name but a different dependency set is *not* considered complete.
+        A reported stage whose dependencies have all completed since it was
+        reported is considered complete as well, so the stage's dependencies
+        should model the completion of any external work submitted for it.
+    """
+
+    def __init__(self, name, requirements, custom_complete=None, task=None):
+        super().__init__(requirements, custom_complete)
+
+        if not name:
+            raise ValueError("Stage name must be a non-empty string")
+        self.name = name
+        self._task = task
+
+    @property
+    def fingerprint(self) -> str:
+        return stage_dependency_fingerprint(self.flat_requirements)
+
+    @property
+    def already_complete(self) -> bool:
+        if self._task is None:
+            return False
+        record = self._task.completed_stages.get(self.name)
+        if not record or record.get("fingerprint") != self.fingerprint:
+            # either never recorded, or recorded with a different set of
+            # dependencies (e.g. after a code change): not complete
+            return False
+        if record.get("status") == "DONE":
+            return True
+        # the stage was reported and its dependencies have completed since
+        return all(dep.complete() for dep in self.flat_requirements)
 
 
 class ExternalTask(Task):
