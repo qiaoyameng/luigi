@@ -217,6 +217,45 @@ For an example of a workflow using dynamic dependencies, see
 `examples/dynamic_requirements.py <https://github.com/spotify/luigi/blob/master/examples/dynamic_requirements.py>`_.
 
 
+Named stages
+^^^^^^^^^^^^
+
+Because a task that yields dynamic dependencies is resumed from scratch every
+time it yields, it can be hard to know how far a previous run got before a
+worker disappeared. A yielded :class:`~luigi.task.DynamicRequirements` can
+therefore be given an optional ``stage`` name:
+
+.. code:: python
+
+    def run(self):
+        if not self.stage_complete("submit_job"):
+            submit_to_external_system()
+        yield luigi.DynamicRequirements(WaitForExternalJob(), stage="submit_job")
+
+        yield luigi.DynamicRequirements(ProcessJobResult(), stage="fetch_result")
+
+The central scheduler stores, per named stage, the exact set of dependency
+task ids it was yielded with together with the stage's completion state. If
+the task is re-entered (in the same or a later run) the worker hands the task
+the completed stage markers via :attr:`~luigi.task.Task.completed_stages`,
+:attr:`~luigi.task.Task.last_completed_stage` and
+:meth:`~luigi.task.Task.stage_complete`, so work that was already performed -
+such as submitting an external job - does not have to be repeated.
+
+A named stage is only considered complete on resume when it is re-yielded with
+the exact same dependency identities as when it was first reached. If the code
+changed and the same stage name now yields a different set of dependencies, the
+stored marker is discarded and the stage is run again; a completed stage can
+never silently stand in for different work.
+
+Note that completing a stage does *not* complete the task. As always, the task
+is only successful when :func:`~luigi.task.Task.run` returns and
+:func:`~luigi.task.Task.complete` is true.
+
+For a runnable two-stage example that survives a mid-run worker failure, see
+`examples/staged_requirements.py <https://github.com/spotify/luigi/blob/master/examples/staged_requirements.py>`_.
+
+
 Task status tracking
 ~~~~~~~~~~~~~~~~~~~~
 

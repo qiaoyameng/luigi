@@ -69,6 +69,10 @@ STATUS_TO_UPSTREAM_MAP = {
 WORKER_STATE_DISABLED = "disabled"
 WORKER_STATE_ACTIVE = "active"
 
+STAGE_PENDING = "PENDING"
+STAGE_DONE = "DONE"
+STAGE_INVALID = "INVALID"
+
 TASK_FAMILY_RE = re.compile(r"([^(_]+)[(_]")
 
 RPC_METHODS = {}
@@ -280,6 +284,8 @@ class Task:
         self.runnable = False
         self.batchable = False
         self.batch_id = None
+        # Map of named stage -> {"deps": frozenset(task_id), "status": ..., "time": float}
+        self.stages = {}
 
     def __repr__(self):
         return "Task(%r)" % vars(self)
@@ -475,6 +481,9 @@ class SimpleTaskState:
             self._status_tasks = collections.defaultdict(dict)
             for task in self._tasks.values():
                 self._status_tasks[task.status][task.id] = task
+                # state files written by older versions don't carry named stages
+                if not hasattr(task, "stages"):
+                    task.stages = {}
         else:
             logger.info("No prior state file exists at %s. Starting with empty state", self._state_path)
 
@@ -800,6 +809,61 @@ class Scheduler:
             self._update_task_history(task, status)
             self._state.set_status(task, status, self._config)
         return {"task_id": task_id, "status": task.status}
+
+    @rpc_method()
+    def update_task_stage(self, task_id=None, stage=None, deps=None, stage_status=STAGE_PENDING, **kwargs):
+        """
+        Persist the dependency set and completion state of a named stage.
+
+        Replaying a completed stage must present the exact same set of dependency
+        ids that was recorded when the stage was first reached. If the code has
+        changed and a different dependency set is reported, the stored stage is
+        invalidated and has to run again rather than being treated as finished.
+        """
+        if task_id is None or stage is None:
+            return None
+
+        task = self._state.get_task(task_id)
+        if task is None:
+            logger.warning("update_task_stage for unknown task %r", task_id)
+            return None
+
+        deps = frozenset(deps or ())
+        stored = task.stages.get(stage)
+
+        if stage_status == STAGE_INVALID:
+            if stored is not None:
+                logger.warning(
+                    "Invalidating stage %r of task %r: dependency set changed from %s to %s",
+                    stage,
+                    task_id,
+                    sorted(stored["deps"]),
+                    sorted(deps),
+                )
+                task.stages.pop(stage, None)
+                task.updated = time.time()
+            return {"task_id": task_id, "stage": stage, "stage_status": None}
+
+        if stored is None:
+            stored = {"deps": deps, "status": stage_status, "time": time.time()}
+            task.stages[stage] = stored
+        elif stored["deps"] != deps:
+            logger.warning(
+                "Rejecting stage %r update for task %r: dependency identity mismatch (%s vs %s); invalidating stored stage",
+                stage,
+                task_id,
+                sorted(stored["deps"]),
+                sorted(deps),
+            )
+            task.stages.pop(stage, None)
+            task.updated = time.time()
+            return {"task_id": task_id, "stage": stage, "stage_status": None}
+        elif stage_status == STAGE_DONE:
+            stored["status"] = STAGE_DONE
+            stored["time"] = time.time()
+            task.updated = time.time()
+
+        return {"task_id": task_id, "stage": stage, "stage_status": task.stages[stage]["status"]}
 
     @rpc_method()
     def add_task(
@@ -1276,6 +1340,11 @@ class Scheduler:
             reply["task_family"] = best_task.family
             reply["task_module"] = getattr(best_task, "module", None)
             reply["task_params"] = best_task.params
+            reply["resume_stages"] = {
+                stage: {"deps": sorted(stage_state["deps"]), "time": stage_state["time"]}
+                for stage, stage_state in best_task.stages.items()
+                if stage_state["status"] == STAGE_DONE
+            }
 
         else:
             reply["task_id"] = None

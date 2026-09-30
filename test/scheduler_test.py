@@ -393,3 +393,79 @@ class StableDoneCooldownSecsTest(unittest.TestCase):
     def test_sending_same_task_twice_without_cooldown_leads_to_double_run(self):
         second_run_result = self.get_second_run_result_on_double_run()
         self.assertEqual(second_run_result.scheduling_succeeded, False)
+
+
+class SchedulerStageTest(unittest.TestCase):
+    def _scheduler_with_task(self, task_id="Parent"):
+        scheduler = luigi.scheduler.Scheduler()
+        scheduler.add_task(worker="W", task_id=task_id, deps=["Dep1"])
+        return scheduler
+
+    def test_pending_stage_is_stored_with_deps(self):
+        scheduler = self._scheduler_with_task()
+        scheduler.update_task_stage(worker="W", task_id="Parent", stage="stage-1", deps=["Dep1", "Dep2"], stage_status=luigi.scheduler.STAGE_PENDING)
+
+        stage = scheduler._state.get_task("Parent").stages["stage-1"]
+        self.assertEqual(stage["status"], luigi.scheduler.STAGE_PENDING)
+        self.assertEqual(stage["deps"], {"Dep1", "Dep2"})
+
+    def test_replaying_completed_stage_requires_same_deps(self):
+        scheduler = self._scheduler_with_task()
+        scheduler.update_task_stage(task_id="Parent", stage="stage-1", deps=["Dep1", "Dep2"], stage_status=luigi.scheduler.STAGE_DONE)
+
+        # same dependency identity keeps the stage finished
+        response = scheduler.update_task_stage(task_id="Parent", stage="stage-1", deps=["Dep2", "Dep1"], stage_status=luigi.scheduler.STAGE_DONE)
+        self.assertEqual(response["stage_status"], luigi.scheduler.STAGE_DONE)
+
+        # a changed code path yielding different deps must not be accepted
+        response = scheduler.update_task_stage(task_id="Parent", stage="stage-1", deps=["Dep1", "Dep3"], stage_status=luigi.scheduler.STAGE_DONE)
+        self.assertIsNone(response["stage_status"])
+        self.assertNotIn("stage-1", scheduler._state.get_task("Parent").stages)
+
+    def test_invalidating_a_stage_drops_the_marker(self):
+        scheduler = self._scheduler_with_task()
+        scheduler.update_task_stage(task_id="Parent", stage="stage-1", deps=["Dep1"], stage_status=luigi.scheduler.STAGE_DONE)
+        response = scheduler.update_task_stage(task_id="Parent", stage="stage-1", deps=["Dep1"], stage_status=luigi.scheduler.STAGE_INVALID)
+        self.assertIsNone(response["stage_status"])
+        self.assertEqual(scheduler._state.get_task("Parent").stages, {})
+
+    def test_get_work_returns_only_completed_stage_markers(self):
+        scheduler = self._scheduler_with_task()
+        scheduler.add_task(worker="W", task_id="Dep1", status=luigi.scheduler.DONE, runnable=False)
+        scheduler.update_task_stage(task_id="Parent", stage="stage-1", deps=["Dep1"], stage_status=luigi.scheduler.STAGE_DONE)
+        scheduler.update_task_stage(task_id="Parent", stage="stage-2", deps=["Dep2"], stage_status=luigi.scheduler.STAGE_PENDING)
+
+        reply = scheduler.get_work(worker="W")
+        self.assertEqual(
+            reply["resume_stages"],
+            {"stage-1": {"deps": ["Dep1"], "time": scheduler._state.get_task("Parent").stages["stage-1"]["time"]}},
+        )
+
+    def test_completed_stage_does_not_make_task_done(self):
+        scheduler = self._scheduler_with_task()
+        scheduler.update_task_stage(task_id="Parent", stage="stage-1", deps=["Dep1"], stage_status=luigi.scheduler.STAGE_DONE)
+        self.assertEqual(scheduler._state.get_task("Parent").status, luigi.scheduler.PENDING)
+
+    def test_stages_survive_state_dump_and_load(self):
+        with tempfile.NamedTemporaryFile(delete=True) as fn:
+            scheduler = luigi.scheduler.Scheduler(state_path=fn.name)
+            scheduler.add_task(worker="W", task_id="Parent", deps=["Dep1"])
+            scheduler.update_task_stage(task_id="Parent", stage="stage-1", deps=["Dep1"], stage_status=luigi.scheduler.STAGE_DONE)
+            scheduler.dump()
+
+            restored = luigi.scheduler.Scheduler(state_path=fn.name)
+            restored.load()
+            stage = restored._state.get_task("Parent").stages["stage-1"]
+            self.assertEqual(stage["status"], luigi.scheduler.STAGE_DONE)
+            self.assertEqual(stage["deps"], {"Dep1"})
+
+    def test_loaded_old_state_without_stages_keeps_working(self):
+        with tempfile.NamedTemporaryFile(delete=True) as fn:
+            task = luigi.scheduler.Task(task_id="Parent", status=luigi.scheduler.PENDING, deps=["Dep1"])
+            with open(fn.name, "wb") as fobj:
+                pickle.dump(({"Parent": task}, {}, {}), fobj)
+
+            scheduler = luigi.scheduler.Scheduler(state_path=fn.name)
+            scheduler.load()
+            scheduler.update_task_stage(task_id="Parent", stage="stage-1", deps=["Dep1"], stage_status=luigi.scheduler.STAGE_PENDING)
+            self.assertEqual(scheduler._state.get_task("Parent").stages["stage-1"]["status"], luigi.scheduler.STAGE_PENDING)

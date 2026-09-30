@@ -52,11 +52,25 @@ import traceback
 from luigi import notifications
 from luigi.event import Event
 from luigi.parameter import BoolParameter, FloatParameter, IntParameter, OptionalParameter, Parameter, TimeDeltaParameter
-from luigi.scheduler import DISABLED, DONE, FAILED, PENDING, UNKNOWN, WORKER_STATE_ACTIVE, WORKER_STATE_DISABLED, RetryPolicy, Scheduler
+from luigi.scheduler import (
+    DISABLED,
+    DONE,
+    FAILED,
+    PENDING,
+    STAGE_DONE,
+    STAGE_INVALID,
+    STAGE_PENDING,
+    UNKNOWN,
+    WORKER_STATE_ACTIVE,
+    WORKER_STATE_DISABLED,
+    RetryPolicy,
+    Scheduler,
+)
 from luigi.target import Target
 from luigi.task import Config, DynamicRequirements, Task, flatten
 from luigi.task_register import TaskClassException, load_task
 from luigi.task_status import RUNNING
+from luigi.rpc import RPCError
 
 logger = logging.getLogger("luigi-interface")
 
@@ -161,10 +175,30 @@ class TaskProcess(multiprocessing.Process):
             if not isinstance(requires, DynamicRequirements):
                 requires = DynamicRequirements(requires)
 
+            stage = requires.stage
+            stage_dep_ids = [dep.task_id for dep in requires.flat_requirements]
+
+            if stage is not None:
+                completed_stage = self.task.completed_stages.get(stage)
+                if completed_stage is not None and tuple(completed_stage.get("deps", ())) == tuple(stage_dep_ids):
+                    # Scheduler already completed this stage for exactly these
+                    # dependencies. Skip it without re-running the stage's work.
+                    next_send = requires.paths
+                    continue
+
+                # Either a new stage or a replay with a changed dependency
+                # identity. Drop any stale marker before registering the run.
+                if completed_stage is not None:
+                    self.status_reporter.update_task_stage(stage=stage, deps=stage_dep_ids, stage_status=STAGE_INVALID)
+                self.status_reporter.update_task_stage(stage=stage, deps=stage_dep_ids, stage_status=STAGE_PENDING)
+
             if not requires.complete(self.check_complete):
                 # not all requirements are complete, return them which adds them to the tree
                 new_deps = [(t.task_module, t.task_family, t.to_str_params()) for t in requires.flat_requirements]
-                return new_deps
+                return {"new_deps": new_deps, "stage": stage, "stage_deps": stage_dep_ids}
+
+            if stage is not None:
+                self.status_reporter.update_task_stage(stage=stage, deps=stage_dep_ids, stage_status=STAGE_DONE)
 
             # get the next generator result
             next_send = requires.paths
@@ -241,7 +275,13 @@ class TaskProcess(multiprocessing.Process):
             expl = self._handle_run_exception(ex)
 
         finally:
-            self.result_queue.put((self.task.task_id, status, expl, missing, new_deps))
+            stage = None
+            stage_deps = None
+            if isinstance(new_deps, dict):
+                stage = new_deps["stage"]
+                stage_deps = new_deps["stage_deps"]
+                new_deps = new_deps["new_deps"]
+            self.result_queue.put((self.task.task_id, status, expl, missing, new_deps, stage, stage_deps))
 
     def _handle_run_exception(self, ex):
         logger.exception("[pid %s] Worker %s failed    %s", os.getpid(), self.worker_id, self.task)
@@ -334,6 +374,15 @@ class TaskStatusReporter:
 
     def decrease_running_resources(self, decrease_resources):
         self._scheduler.decrease_running_task_resources(self._task_id, decrease_resources)
+
+    def update_task_stage(self, stage, deps, stage_status):
+        try:
+            self._scheduler.update_task_stage(task_id=self._task_id, stage=stage, deps=deps, stage_status=stage_status)
+        except RPCError as ex:
+            # An older scheduler (or one without the stage API) simply cannot
+            # persist named stages; fall back to ordinary dynamic-dependency
+            # behavior, which re-runs the stage instead of failing the task.
+            logger.debug("Scheduler cannot record stage %s for task %s (%s)", stage, self._task_id, ex)
 
     def report_task_statistics(self, statistics):
         self._scheduler.report_task_statistics(self._task_id, statistics)
@@ -1012,6 +1061,9 @@ class Worker:
             batch_tasks = filter(None, [self._scheduled_tasks.get(batch_id) for batch_id in r["batch_task_ids"]])
             self._batch_running_tasks[task_id] = batch_tasks
 
+        if task_id is not None and "resume_stages" in r and task_id in self._scheduled_tasks:
+            self._scheduled_tasks[task_id]._resume_stages = r["resume_stages"]
+
         return GetWorkResponse(
             task_id=task_id,
             running_tasks=running_tasks,
@@ -1077,7 +1129,7 @@ class Worker:
                 continue
 
             logger.info(error_msg)
-            self._task_result_queue.put((task_id, FAILED, error_msg, [], []))
+            self._task_result_queue.put((task_id, FAILED, error_msg, [], [], None, None))
 
     def _handle_next_task(self):
         """
@@ -1093,7 +1145,7 @@ class Worker:
             self._purge_children()  # Deal with subprocess failures
 
             try:
-                task_id, status, expl, missing, new_requirements = self._task_result_queue.get(timeout=self._config.wait_interval)
+                task_id, status, expl, missing, new_requirements, stage, stage_deps = self._task_result_queue.get(timeout=self._config.wait_interval)
             except Queue.Empty:
                 return
 
@@ -1114,6 +1166,17 @@ class Worker:
                 for t in new_req:
                     self.add(t)
                 new_deps = [t.task_id for t in new_req]
+
+            if stage is not None and status == PENDING:
+                # The subprocess reported a named stage before it yielded back
+                # control. Register its pending dependency identity now so it
+                # survives even if this worker disappears right afterwards.
+                self._scheduler.update_task_stage(
+                    task_id=task_id,
+                    stage=stage,
+                    deps=stage_deps,
+                    stage_status=STAGE_PENDING,
+                )
 
             self._add_task(
                 worker=self._id,

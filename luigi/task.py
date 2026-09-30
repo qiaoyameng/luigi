@@ -313,6 +313,42 @@ class Task(metaclass=Register):
         # TODO(erikbern): we should think about a language-agnostic mechanism
         return self.__class__.__module__
 
+    # Names of named stages that the worker fills in before run() is entered.
+    # Maps stage name -> {"deps": (task_id, ...), "time": float} for stages the
+    # scheduler already considers complete.
+    _resume_stages = None
+
+    @property
+    def completed_stages(self):
+        """
+        Mapping of named stages already completed in earlier runs of this task.
+
+        Each value maps ``"deps"`` to the tuple of dependency task ids that
+        were yielded at the stage and ``"time"`` to when it was recorded.
+        Empty for ordinary tasks and on the first run of a staged task.
+        """
+        if self._resume_stages is None:
+            return {}
+        return self._resume_stages
+
+    @property
+    def last_completed_stage(self):
+        """
+        Name of the most recently completed named stage, or ``None``.
+
+        Note that a completed stage does not imply the whole task is done; final
+        success is still determined by :py:meth:`output`/:py:meth:`complete`.
+        """
+        if not self.completed_stages:
+            return None
+        return max(self.completed_stages, key=lambda name: self.completed_stages[name]["time"])
+
+    def stage_complete(self, stage):
+        """
+        Return whether a named stage was completed with its dependencies.
+        """
+        return stage in self.completed_stages
+
     _visible_in_registry = True  # TODO: Consider using in luigi.util as well
 
     __not_user_specified = "__not_user_specified"
@@ -820,12 +856,17 @@ class DynamicRequirements(object):
        The optional, custom function performing the completeness check of the wrapped requirements.
     """
 
-    def __init__(self, requirements, custom_complete=None):
+    def __init__(self, requirements, custom_complete=None, stage=None):
         super().__init__()
 
         # store attributes
         self.requirements = requirements
         self.custom_complete = custom_complete
+        #: Optional name of the stage this yield represents. When set, the
+        #: scheduler records the stage's dependency identity and hands the
+        #: completion marker back to the task if it is rescheduled, provided
+        #: the same dependencies are yielded.
+        self.stage = stage
 
         # cached flat requirements and paths
         self._flat_requirements = None
