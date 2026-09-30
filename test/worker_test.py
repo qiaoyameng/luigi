@@ -880,6 +880,47 @@ class WorkerTest(LuigiTestCase):
 
         self.assertEqual(3, len(runs))
 
+    def test_batch_job_with_per_member_results(self):
+        runs = []
+        completed = set()
+
+        class PerMemberBatchJob(luigi.Task):
+            values = luigi.parameter.Parameter(batch_method=",".join)
+
+            def run(self):
+                runs.append(self.values)
+                results = {}
+                for value in self.values.split(","):
+                    member_id = PerMemberBatchJob(values=value).task_id
+                    if len(runs) == 1 and value == "2":
+                        results[member_id] = "failure"
+                    elif len(runs) == 1 and value == "3":
+                        results[member_id] = "unhandled"
+                    else:
+                        completed.add(value)
+                        results[member_id] = "success"
+                self.report_batch_results(results)
+
+            def complete(self):
+                return all(value in completed for value in self.values.split(","))
+
+        scheduler = Scheduler(retry_delay=0.1, retry_count=3, prune_on_get_work=True)
+        worker = Worker(scheduler=scheduler, keep_alive=True, wait_interval=0.1, wait_jitter=0.0)
+
+        tasks = [PerMemberBatchJob(values=str(i)) for i in (1, 2, 3)]
+        for task in tasks:
+            self.assertTrue(worker.add(task))
+        self.assertTrue(worker.run())
+
+        # the failed and unhandled members were rescheduled and re-executed,
+        # the successful member "1" was not run again
+        self.assertEqual(["1,2,3", "3", "2"], runs)
+        self.assertEqual({"1", "2", "3"}, completed)
+        for task in tasks:
+            self.assertTrue(task.complete())
+        self.assertEqual(set(), set(scheduler.task_list("PENDING", "")))
+        self.assertEqual(set(), set(scheduler.task_list("FAILED", "")))
+
     def test_fail_max_batch_job(self):
         class MaxBatchFailJob(luigi.Task):
             value = luigi.IntParameter(batch_method=max)

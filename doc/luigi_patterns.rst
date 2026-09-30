@@ -181,6 +181,36 @@ task that ends up running will use resources. The scheduler only checks
 that there are sufficient resources for each task individually before
 batching them all together.
 
+Reporting per-member results of a batch
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default, every member of a batch gets the same final status as the
+task that ended up running. If the members of a batch can succeed or
+fail independently, the running task can instead report a result per
+member by calling ``self.report_batch_results`` inside ``run()``. It
+takes a dict mapping each member task id to ``"success"``, ``"failure"``
+or ``"unhandled"``:
+
+.. code-block:: python
+
+    class A(luigi.Task):
+        values = luigi.Parameter(batch_method=",".join)
+
+        def run(self):
+            results = {}
+            for value in self.values.split(","):
+                member_id = A(values=value).task_id
+                results[member_id] = "success" if process(value) else "failure"
+            self.report_batch_results(results)
+
+The scheduler updates each member individually: successful members are
+marked DONE, failed members go through the normal retry logic and
+unhandled members (as well as members missing from the report) go back
+to PENDING, so only they get scheduled again. Members that are not part
+of the batch and reports for unknown or already finalized batches are
+rejected and never treated as successful. If the worker dies without
+reporting, the usual dead worker recovery applies to all members.
+
 Tasks that regularly overwrite the same data source
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

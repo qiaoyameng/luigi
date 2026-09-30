@@ -41,7 +41,20 @@ from luigi.batch_notifier import BatchNotifier
 from luigi.metrics import MetricsCollectors
 from luigi.parameter import ParameterVisibility
 from luigi.task import Config
-from luigi.task_status import BATCH_RUNNING, DISABLED, DONE, FAILED, PENDING, RUNNING, SUSPENDED, UNKNOWN
+from luigi.task_status import (
+    BATCH_RESULT_FAILURE,
+    BATCH_RESULT_SUCCESS,
+    BATCH_RESULT_UNHANDLED,
+    BATCH_RESULTS,
+    BATCH_RUNNING,
+    DISABLED,
+    DONE,
+    FAILED,
+    PENDING,
+    RUNNING,
+    SUSPENDED,
+    UNKNOWN,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -800,6 +813,70 @@ class Scheduler:
             self._update_task_history(task, status)
             self._state.set_status(task, status, self._config)
         return {"task_id": task_id, "status": task.status}
+
+    @rpc_method()
+    def report_batch_results(self, batch_id=None, results=None, **kwargs):
+        """
+        Report per-member results of a batch run.
+
+        ``results`` maps member task ids to one of "success", "failure" or
+        "unhandled". Each member of the batch is updated individually:
+        successful members are marked DONE, failed members are marked FAILED
+        (and go through the normal retry logic) and unhandled members go back
+        to PENDING so that only they get rescheduled.
+
+        Members of the batch without a valid result (missing from the report
+        or reported with an unknown result value) are treated as unhandled,
+        and invalid member ids and reports for unknown or already finalized
+        batches are rejected: none of them are ever silently treated as
+        successful. If the batch worker dies without reporting, the members
+        stay BATCH_RUNNING and the usual dead worker recovery applies.
+        """
+        worker_id = kwargs["worker"]
+        response = {"batch_id": batch_id, "applied": {}, "missing": [], "errors": {}}
+
+        if not batch_id or not isinstance(results, dict):
+            response["errors"]["batch_id"] = "a batch_id and a results dict are required"
+            return response
+
+        members = {task.id: task for task in self._state.get_batch_running_tasks(batch_id)}
+        if not members:
+            # unknown batch, or a duplicate report for an already finalized batch
+            response["errors"]["batch_id"] = "unknown or already finalized batch_id"
+            return response
+
+        if any(task.worker_running != worker_id for task in members.values()):
+            response["errors"]["batch_id"] = "batch is not running on this worker"
+            return response
+
+        status_by_result = {
+            BATCH_RESULT_SUCCESS: DONE,
+            BATCH_RESULT_FAILURE: FAILED,
+            BATCH_RESULT_UNHANDLED: PENDING,
+        }
+        for task_id, result in results.items():
+            task = members.get(task_id)
+            if task is None:
+                response["errors"][task_id] = "not a member of this batch"
+            elif result not in BATCH_RESULTS:
+                response["errors"][task_id] = "unknown batch result {!r}".format(result)
+            else:
+                status = status_by_result[result]
+                self._update_task_history(task, status)
+                self._state.set_status(task, status, self._config)
+                task.batch_id = None
+                response["applied"][task_id] = task.status
+
+        # members without a valid result must not be treated as successful:
+        # reset them to PENDING so that they get rescheduled
+        for task_id, task in members.items():
+            if task.status == BATCH_RUNNING:
+                self._update_task_history(task, PENDING)
+                self._state.set_status(task, PENDING, self._config)
+                task.batch_id = None
+                response["missing"].append(task_id)
+
+        return response
 
     @rpc_method()
     def add_task(

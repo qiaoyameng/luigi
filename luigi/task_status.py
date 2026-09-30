@@ -26,3 +26,10 @@ BATCH_RUNNING = "BATCH_RUNNING"
 SUSPENDED = "SUSPENDED"  # Only kept for backward compatibility with old clients
 UNKNOWN = "UNKNOWN"
 DISABLED = "DISABLED"
+
+# Possible per-member results of a batch run, reported through
+# Scheduler.report_batch_results
+BATCH_RESULT_SUCCESS = "success"
+BATCH_RESULT_FAILURE = "failure"
+BATCH_RESULT_UNHANDLED = "unhandled"
+BATCH_RESULTS = frozenset((BATCH_RESULT_SUCCESS, BATCH_RESULT_FAILURE, BATCH_RESULT_UNHANDLED))

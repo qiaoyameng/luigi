@@ -488,6 +488,7 @@ class Task(metaclass=Register):
         self.set_tracking_url = None
         self.set_status_message = None
         self.set_progress_percentage = None
+        self.report_batch_results = None
 
     @property
     def param_args(self):

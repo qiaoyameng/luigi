@@ -111,6 +111,7 @@ class TaskProcess(multiprocessing.Process):
         "update_status_message": "set_status_message",
         "update_progress_percentage": "set_progress_percentage",
         "decrease_running_resources": "decrease_running_resources",
+        "report_batch_results": "report_batch_results",
         "scheduler_messages": "scheduler_messages",
     }
 
@@ -317,10 +318,11 @@ class TaskStatusReporter:
     where fork method needs to pickle the process object (e.g.  Windows).
     """
 
-    def __init__(self, scheduler, task_id, worker_id, scheduler_messages):
+    def __init__(self, scheduler, task_id, worker_id, scheduler_messages, batch_id=None):
         self._task_id = task_id
         self._worker_id = worker_id
         self._scheduler = scheduler
+        self._batch_id = batch_id
         self.scheduler_messages = scheduler_messages
 
     def update_tracking_url(self, tracking_url):
@@ -337,6 +339,15 @@ class TaskStatusReporter:
 
     def report_task_statistics(self, statistics):
         self._scheduler.report_task_statistics(self._task_id, statistics)
+
+    def report_batch_results(self, results):
+        """
+        Report per-member results of the batch this task is running.
+
+        ``results`` maps member task ids to "success", "failure" or
+        "unhandled". See :py:meth:`luigi.scheduler.Scheduler.report_batch_results`.
+        """
+        return self._scheduler.report_batch_results(batch_id=self._batch_id, results=results, worker=self._worker_id)
 
 
 class SchedulerMessage:
@@ -568,6 +579,7 @@ class Worker:
         self._scheduled_tasks = {}
         self._suspended_tasks = {}
         self._batch_running_tasks = {}
+        self._batch_ids = {}
         self._batch_families_sent = set()
 
         self._first_task = None
@@ -1011,6 +1023,7 @@ class Worker:
         if task_id is not None and "batch_task_ids" in r:
             batch_tasks = filter(None, [self._scheduled_tasks.get(batch_id) for batch_id in r["batch_task_ids"]])
             self._batch_running_tasks[task_id] = batch_tasks
+            self._batch_ids[task_id] = r["batch_id"]
 
         return GetWorkResponse(
             task_id=task_id,
@@ -1044,7 +1057,7 @@ class Worker:
 
     def _create_task_process(self, task):
         message_queue = multiprocessing.Queue() if task.accepts_messages else None
-        reporter = TaskStatusReporter(self._scheduler, task.task_id, self._id, message_queue)
+        reporter = TaskStatusReporter(self._scheduler, task.task_id, self._id, message_queue, batch_id=self._batch_ids.get(task.task_id))
         use_multiprocessing = self._config.force_multiprocessing or bool(self.worker_processes > 1)
         return ContextManagedTaskProcess(
             self._config.task_process_context,
@@ -1131,6 +1144,7 @@ class Worker:
             )
 
             self._running_tasks.pop(task_id)
+            self._batch_ids.pop(task_id, None)
 
             # re-add task to reschedule missing dependencies
             if missing:

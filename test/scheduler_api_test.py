@@ -406,6 +406,129 @@ class SchedulerApiTest(unittest.TestCase):
         self.sch.prune()
         self.assertEqual({"A_1", "A_2"}, set(self.sch.task_list(FAILED, "").keys()))
 
+    def _start_three_member_batch(self):
+        self.sch.add_task_batcher(worker=WORKER, task_family="A", batched_args=["a"])
+        for i in (1, 2, 3):
+            self.sch.add_task(worker=WORKER, task_id="A_a_%i" % i, family="A", params={"a": str(i)}, batchable=True)
+        response = self.sch.get_work(worker=WORKER)
+        self.assertIsNone(response["task_id"])
+        self.assertEqual({"A_a_1", "A_a_2", "A_a_3"}, set(response["batch_task_ids"]))
+        return response["batch_id"]
+
+    def test_report_batch_results_partial_success(self):
+        batch_id = self._start_three_member_batch()
+
+        response = self.sch.report_batch_results(
+            worker=WORKER,
+            batch_id=batch_id,
+            results={"A_a_1": "success", "A_a_2": "failure", "A_a_3": "unhandled"},
+        )
+
+        self.assertEqual({"A_a_1": DONE, "A_a_2": FAILED, "A_a_3": PENDING}, response["applied"])
+        self.assertEqual([], response["missing"])
+        self.assertEqual({}, response["errors"])
+        self.assertEqual({"A_a_1"}, set(self.sch.task_list(DONE, "").keys()))
+        self.assertEqual({"A_a_2"}, set(self.sch.task_list(FAILED, "").keys()))
+        self.assertEqual({"A_a_3"}, set(self.sch.task_list(PENDING, "").keys()))
+
+    def test_report_batch_results_only_reschedules_unsuccessful_members(self):
+        self.setTime(1000)
+        batch_id = self._start_three_member_batch()
+        self.sch.report_batch_results(
+            worker=WORKER,
+            batch_id=batch_id,
+            results={"A_a_1": "success", "A_a_2": "failure", "A_a_3": "unhandled"},
+        )
+
+        # let the retry delay of the failed member expire
+        for t in range(1001, 1102):
+            self.setTime(t)
+            self.sch.ping(worker=WORKER)
+        self.sch.prune()
+
+        response = self.sch.get_work(worker=WORKER)
+        self.assertIsNone(response["task_id"])
+        self.assertEqual({"A_a_2", "A_a_3"}, set(response["batch_task_ids"]))
+        self.assertEqual(["2", "3"], sorted(response["task_params"]["a"]))
+        # the successful member is not scheduled again
+        self.assertEqual({"A_a_1"}, set(self.sch.task_list(DONE, "").keys()))
+
+    def test_report_batch_results_rejects_invalid_members_and_results(self):
+        batch_id = self._start_three_member_batch()
+
+        response = self.sch.report_batch_results(
+            worker=WORKER,
+            batch_id=batch_id,
+            results={"A_a_1": "success", "A_a_9": "success", "A_a_2": "bogus"},
+        )
+
+        self.assertEqual({"A_a_1": DONE}, response["applied"])
+        self.assertIn("A_a_9", response["errors"])
+        self.assertIn("A_a_2", response["errors"])
+        # members without a valid result are rescheduled, not treated as successful
+        self.assertEqual({"A_a_2", "A_a_3"}, set(response["missing"]))
+        self.assertEqual({"A_a_2", "A_a_3"}, set(self.sch.task_list(PENDING, "").keys()))
+        self.assertEqual({"A_a_1"}, set(self.sch.task_list(DONE, "").keys()))
+
+    def test_report_batch_results_rejects_duplicate_report(self):
+        batch_id = self._start_three_member_batch()
+        results = {"A_a_1": "success", "A_a_2": "failure", "A_a_3": "unhandled"}
+        first = self.sch.report_batch_results(worker=WORKER, batch_id=batch_id, results=results)
+        self.assertEqual({}, first["errors"])
+
+        second = self.sch.report_batch_results(worker=WORKER, batch_id=batch_id, results=results)
+        self.assertEqual({}, second["applied"])
+        self.assertIn("batch_id", second["errors"])
+
+        # the duplicate report did not change any member status
+        self.assertEqual({"A_a_1"}, set(self.sch.task_list(DONE, "").keys()))
+        self.assertEqual({"A_a_2"}, set(self.sch.task_list(FAILED, "").keys()))
+        self.assertEqual({"A_a_3"}, set(self.sch.task_list(PENDING, "").keys()))
+
+    def test_report_batch_results_unknown_batch(self):
+        response = self.sch.report_batch_results(worker=WORKER, batch_id="no_such_batch", results={"A_a_1": "success"})
+        self.assertEqual({}, response["applied"])
+        self.assertIn("batch_id", response["errors"])
+
+    def test_report_batch_results_rejects_other_worker(self):
+        batch_id = self._start_three_member_batch()
+
+        response = self.sch.report_batch_results(worker="other_worker", batch_id=batch_id, results={"A_a_1": "success"})
+
+        self.assertEqual({}, response["applied"])
+        self.assertIn("batch_id", response["errors"])
+        self.assertEqual({"A_a_1", "A_a_2", "A_a_3"}, set(self.sch.task_list(BATCH_RUNNING, "").keys()))
+
+    def test_report_batch_results_not_sent_keeps_dead_worker_recovery(self):
+        self.setTime(1)
+        self._start_three_member_batch()
+
+        # the batch worker dies without reporting per-member results:
+        # the original dead worker recovery marks every member as FAILED
+        self.setTime(601)
+        self.sch.prune()
+        self.assertEqual({"A_a_1", "A_a_2", "A_a_3"}, set(self.sch.task_list(FAILED, "").keys()))
+
+    def test_report_batch_results_updates_task_history(self):
+        history = mock.Mock()
+        sch = Scheduler(task_history_impl=history, **self.get_scheduler_config())
+        sch.add_task_batcher(worker=WORKER, task_family="A", batched_args=["a"])
+        for i in (1, 2, 3):
+            sch.add_task(worker=WORKER, task_id="A_a_%i" % i, family="A", params={"a": str(i)}, batchable=True)
+        batch_id = sch.get_work(worker=WORKER)["batch_id"]
+        history.reset_mock()
+
+        sch.report_batch_results(
+            worker=WORKER,
+            batch_id=batch_id,
+            results={"A_a_1": "success", "A_a_2": "failure", "A_a_3": "unhandled"},
+        )
+
+        finished = {call[0][0].id: call[0][1] for call in history.task_finished.call_args_list}
+        self.assertEqual({"A_a_1": True, "A_a_2": False}, finished)
+        scheduled = {call[0][0].id for call in history.task_scheduled.call_args_list}
+        self.assertEqual({"A_a_3"}, scheduled)
+
     def test_batch_fail_max_from_dead_worker(self):
         self.setTime(1)
         self._start_simple_batch(use_max=True)
