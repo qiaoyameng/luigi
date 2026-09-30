@@ -89,8 +89,14 @@ class _WorkerSchedulerFactory:
     def create_remote_scheduler(self, url):
         return rpc.RemoteScheduler(url)
 
-    def create_worker(self, scheduler, worker_processes, assistant=False):
-        return worker.Worker(scheduler=scheduler, worker_processes=worker_processes, assistant=assistant)
+    def create_worker(self, scheduler, worker_processes, assistant=False, secret_resolvers=None, secret_resolver=None):
+        return worker.Worker(
+            scheduler=scheduler,
+            worker_processes=worker_processes,
+            assistant=assistant,
+            secret_resolvers=secret_resolvers,
+            secret_resolver=secret_resolver,
+        )
 
 
 def _schedule_and_run(tasks, worker_scheduler_factory=None, override_defaults=None):
@@ -107,7 +113,12 @@ def _schedule_and_run(tasks, worker_scheduler_factory=None, override_defaults=No
         worker_scheduler_factory = _WorkerSchedulerFactory()
     if override_defaults is None:
         override_defaults = {}
-    env_params = core(**override_defaults)
+    secret_resolvers = override_defaults.get("secret_resolvers")
+    secret_resolver = override_defaults.get("secret_resolver")
+    env_overrides = {
+        key: value for key, value in override_defaults.items() if key not in ("secret_resolvers", "secret_resolver")
+    }
+    env_params = core(**env_overrides)
 
     InterfaceLogging.setup(env_params)
 
@@ -127,7 +138,13 @@ def _schedule_and_run(tasks, worker_scheduler_factory=None, override_defaults=No
             )
         sch = worker_scheduler_factory.create_remote_scheduler(url=url)
 
-    worker = worker_scheduler_factory.create_worker(scheduler=sch, worker_processes=env_params.workers, assistant=env_params.assistant)
+    worker = worker_scheduler_factory.create_worker(
+        scheduler=sch,
+        worker_processes=env_params.workers,
+        assistant=env_params.assistant,
+        secret_resolvers=secret_resolvers,
+        secret_resolver=secret_resolver,
+    )
 
     success = True
     logger = logging.getLogger("luigi-interface")

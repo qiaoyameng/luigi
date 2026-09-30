@@ -800,6 +800,91 @@ class StrParameter(Parameter[str]):
         return str(x)
 
 
+class SecretParameter(Parameter["SecretReference"]):
+    """
+    Parameter that points at a secret (access token, password, API key) by
+    reference instead of carrying the plaintext.
+
+    The parameter value is a :class:`~luigi.secrets.SecretReference`, written
+    as ``"<name>@<version>"``.  Only the reference is serialized, so it is the
+    only thing that ends up in the task id, scheduler state, scheduler RPC
+    payloads, error pages, ``repr()`` output and logs.  The plaintext is
+    fetched on the worker, immediately before the task runs, via an explicit
+    :class:`~luigi.secrets.SecretResolver` registered on the worker
+    (``Worker(secret_resolvers={...})`` / ``luigi.build(...,
+    secret_resolvers={...})``) or attached to the parameter itself::
+
+        class CallApi(luigi.Task):
+            token = luigi.SecretParameter()  # e.g. "github-token@v3"
+
+            def run(self):
+                # self.token behaves like the plaintext string only here
+                requests.get(..., headers={"Authorization": f"Bearer {self.token}"})
+
+    Because the version is part of the reference (and therefore of the task
+    id), rotating a secret to a new version creates a distinct task rather
+    than silently changing what an existing task id points at.
+
+    Secret parameters are always *significant* (identity must distinguish
+    references/versions) and *public* (the reference itself is not a
+    secret); the resolved plaintext is never exposed.
+
+    If the resolver cannot provide the plaintext, the task does not start
+    and fails with a reference-only message; the next retry re-runs the
+    resolver.
+    """
+
+    def __init__(
+        self,
+        default: Union["SecretReference", str, _NoValueType] = _no_value,
+        *,
+        resolver: Optional["SecretResolver"] = None,
+        resolver_name: Optional[str] = None,
+        **kwargs: Unpack[_ParameterKwargs],
+    ):
+        # The reference is the task identity and is safe to expose, so it must
+        # be significant and travel to the scheduler as a public parameter.
+        if kwargs.get("significant", True) is False:
+            raise ParameterException(
+                "SecretParameter must remain significant: the secret reference/version is part of the task identity"
+            )
+        if kwargs.get("visibility", ParameterVisibility.PUBLIC) != ParameterVisibility.PUBLIC:
+            raise ParameterException("SecretParameter must remain public: the reference itself is not sensitive")
+        kwargs["significant"] = True
+        kwargs["visibility"] = ParameterVisibility.PUBLIC
+        if resolver is not None and resolver_name is not None:
+            raise ParameterException("Pass either resolver or resolver_name, not both")
+        self.resolver = resolver
+        self.resolver_name = resolver_name
+        super().__init__(default=default, **kwargs)
+
+    def parse(self, x):
+        """Parse ``"<name>@<version>"`` (or a reference object/dict)."""
+        from luigi.secrets import SecretReference
+
+        return SecretReference.parse(x)
+
+    def normalize(self, x):
+        # parse() accepts both plain references, resolved values (reduced to
+        # their reference) and "<name>@<version>" strings.
+        return self.parse(x)
+
+    def serialize(self, x):
+        from luigi.secrets import SecretReference
+
+        return SecretReference.parse(x).serialize()
+
+    def _warn_on_wrong_param_type(self, param_name, param_value):
+        from luigi.secrets import SecretReference
+
+        if not isinstance(param_value, SecretReference):
+            warnings.warn(
+                'SecretParameter "{}" should hold a SecretReference ("<name>@<version>"), got {!r}.'.format(
+                    param_name, param_value
+                )
+            )
+
+
 class IntParameter(Parameter[int]):
     """
     Parameter whose value is an ``int``.

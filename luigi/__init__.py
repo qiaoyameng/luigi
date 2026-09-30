@@ -55,11 +55,19 @@ from luigi.parameter import (
     OptionalTupleParameter,
     Parameter,
     PathParameter,
+    SecretParameter,
     StrParameter,
     TaskParameter,
     TimeDeltaParameter,
     TupleParameter,
     YearParameter,
+)
+from luigi.secrets import (
+    ResolvedSecret,
+    SecretReference,
+    SecretReferenceParseException,
+    SecretResolutionError,
+    SecretResolver,
 )
 from luigi.rpc import RemoteScheduler, RPCError
 from luigi.target import Target
@@ -92,6 +100,12 @@ __all__ = [
     "RPCError",
     "parameter",
     "Parameter",
+    "SecretParameter",
+    "SecretReference",
+    "ResolvedSecret",
+    "SecretResolver",
+    "SecretResolutionError",
+    "SecretReferenceParseException",
     "DateParameter",
     "MonthParameter",
     "YearParameter",

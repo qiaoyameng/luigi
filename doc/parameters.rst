@@ -107,6 +107,48 @@ parameters are public, but you can also set them hidden or private.
 
 ``ParameterVisibility.PRIVATE`` - visible only inside task.
 
+Secret parameters
+^^^^^^^^^^^^^^^^^
+
+Some parameters are secrets -- access tokens, passwords or API keys that
+must never be written into task ids, scheduler state, error pages or logs.
+Use :class:`~luigi.SecretParameter` for those.  A secret parameter carries
+only a *reference* of the form ``"<name>@<version>"``; the plaintext is
+fetched on the worker, immediately before the task runs, through an explicit
+:class:`~luigi.secrets.SecretResolver`:
+
+.. code:: python
+
+    import luigi
+    from luigi.secrets import SecretResolver
+
+    class EnvSecretResolver(SecretResolver):
+        def resolve(self, reference):
+            return os.environ[f"{reference.name}_{reference.version}"]
+
+    class CallApi(luigi.Task):
+        token = luigi.SecretParameter()  # passed as, e.g., "github-token@v3"
+
+        def run(self):
+            # self.token behaves like the plaintext string only while run() executes
+            requests.get(..., headers={"Authorization": f"Bearer {self.token}"})
+
+    luigi.build([CallApi(token="github-token@v3")],
+                local_scheduler=True, secret_resolver=EnvSecretResolver())
+
+Properties worth knowing:
+
+* Only the reference is serialized, so the task id, scheduler RPC payloads,
+  web views, failure messages and logs can never contain the plaintext.
+* The version is part of the task identity: rotating a secret to a new
+  version produces a distinct task instead of changing an existing task id.
+* Every (re)try calls the resolver again.  If resolution fails, the task
+  does not start; it fails with a reference-only explanation and is retried.
+* A resolver can also be attached to the parameter itself
+  (``SecretParameter(resolver=...)``) or looked up by name
+  (``SecretParameter(resolver_name="vault")`` with
+  ``secret_resolvers={"vault": ...}``).
+
 Parameter types
 ^^^^^^^^^^^^^^^
 

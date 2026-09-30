@@ -53,6 +53,7 @@ from luigi import notifications
 from luigi.event import Event
 from luigi.parameter import BoolParameter, FloatParameter, IntParameter, OptionalParameter, Parameter, TimeDeltaParameter
 from luigi.scheduler import DISABLED, DONE, FAILED, PENDING, UNKNOWN, WORKER_STATE_ACTIVE, WORKER_STATE_DISABLED, RetryPolicy, Scheduler
+from luigi.secrets import SecretReference, resolved_task_secrets
 from luigi.target import Target
 from luigi.task import Config, DynamicRequirements, Task, flatten
 from luigi.task_register import TaskClassException, load_task
@@ -72,6 +73,19 @@ fork_lock = threading.Lock()
 # unscientifically just set the final value to a floating point number that
 # "worked for me".
 _WAIT_INTERVAL_EPS = 0.00001
+
+
+def _any_task_secret_reference(task):
+    """Best-effort reference for an unexpected secret-resolution failure."""
+    try:
+        from luigi.parameter import SecretParameter
+
+        for param_name, param_obj in task.get_params():
+            if isinstance(param_obj, SecretParameter):
+                return SecretReference.parse(getattr(task, param_name))
+    except Exception:
+        pass
+    return SecretReference("unknown", "unknown")
 
 
 def _is_external(task):
@@ -125,6 +139,7 @@ class TaskProcess(multiprocessing.Process):
         check_unfulfilled_deps=True,
         check_complete_on_run=False,
         task_completion_cache=None,
+        secret_resolvers=None,
     ):
         super(TaskProcess, self).__init__()
         self.task = task
@@ -137,6 +152,7 @@ class TaskProcess(multiprocessing.Process):
         self.check_unfulfilled_deps = check_unfulfilled_deps
         self.check_complete_on_run = check_complete_on_run
         self.task_completion_cache = task_completion_cache
+        self.secret_resolvers = secret_resolvers or {}
 
         # completeness check using the cache
         self.check_complete = functools.partial(check_complete_cached, completion_cache=task_completion_cache)
@@ -178,6 +194,24 @@ class TaskProcess(multiprocessing.Process):
             currentTime = time.time()
             random.seed(processID * currentTime)
 
+        secret_context = resolved_task_secrets(self.task, self.secret_resolvers)
+        try:
+            # Entering performs the actual resolution.  If a token cannot be
+            # fetched, the task must not start; resolved values exist only
+            # inside this context and are never serialized or logged.
+            secret_context.__enter__()
+        except BaseException as ex:
+            self.result_queue.put((self.task.task_id, FAILED, self._handle_secret_exception(ex), [], []))
+            return
+
+        try:
+            status, expl, missing, new_deps = self._run_task_body()
+        finally:
+            secret_context.__exit__(None, None, None)
+
+        self.result_queue.put((self.task.task_id, status, expl, missing, new_deps))
+
+    def _run_task_body(self):
         status = FAILED
         expl = ""
         missing = []
@@ -240,8 +274,26 @@ class TaskProcess(multiprocessing.Process):
             status = FAILED
             expl = self._handle_run_exception(ex)
 
-        finally:
-            self.result_queue.put((self.task.task_id, status, expl, missing, new_deps))
+        return status, expl, missing, new_deps
+
+    def _handle_secret_exception(self, ex):
+        from luigi.secrets import SecretResolutionError
+
+        if not isinstance(ex, SecretResolutionError):
+            # Defensive: secret resolution must produce reference-safe
+            # errors, but never let an unexpected message reach scheduler
+            # state, emails or logs.
+            reference = _any_task_secret_reference(self.task)
+            ex = SecretResolutionError(reference, type(ex).__name__)
+        logger.error(
+            "[pid %s] Worker %s did not start %s: %s",
+            os.getpid(),
+            self.worker_id,
+            self.task,
+            ex,
+        )
+        self.task.trigger_event(Event.FAILURE, self.task, ex)
+        return str(ex)
 
     def _handle_run_exception(self, ex):
         logger.exception("[pid %s] Worker %s failed    %s", os.getpid(), self.worker_id, self.task)
@@ -545,11 +597,27 @@ class Worker:
     * asks for stuff to do (pulls it in a loop and runs it)
     """
 
-    def __init__(self, scheduler=None, worker_id=None, worker_processes=1, assistant=False, **kwargs):
+    def __init__(
+        self,
+        scheduler=None,
+        worker_id=None,
+        worker_processes=1,
+        assistant=False,
+        secret_resolvers=None,
+        secret_resolver=None,
+        **kwargs,
+    ):
         if scheduler is None:
             scheduler = Scheduler()
 
         self.worker_processes = int(worker_processes)
+        # Explicit mapping of resolver name -> SecretResolver used to fetch
+        # plaintext for SecretParameter values when a task starts running.
+        from luigi.secrets import DEFAULT_RESOLVER_NAME
+
+        self._secret_resolvers = dict(secret_resolvers or {})
+        if secret_resolver is not None:
+            self._secret_resolvers.setdefault(DEFAULT_RESOLVER_NAME, secret_resolver)
         self._worker_info = self._generate_worker_info()
 
         self._config = worker(**kwargs)
@@ -1057,6 +1125,7 @@ class Worker:
             check_unfulfilled_deps=self._config.check_unfulfilled_deps,
             check_complete_on_run=self._config.check_complete_on_run,
             task_completion_cache=self._task_completion_cache,
+            secret_resolvers=self._secret_resolvers,
         )
 
     def _purge_children(self):
