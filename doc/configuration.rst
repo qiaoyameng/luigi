@@ -857,6 +857,24 @@ send_messages
   the central scheduler provides a simple prompt per task to send messages.
   Defaults to true.
 
+wait_aging_enabled
+  When true, PENDING tasks whose dependencies are all complete gradually gain
+  extra scheduling weight the longer they keep waiting. This lets a long
+  waiting task eventually overtake a stream of newer, higher-priority short
+  tasks once its resources free up, while task priority is still respected.
+  Only time spent runnable counts: time blocked on unfinished dependencies,
+  time spent running and retry delays do not age. Defaults to false, which
+  keeps the original priority-based scheduling order unchanged.
+
+wait_aging_step
+  Number of runnable waiting seconds required to gain one point of extra
+  scheduling weight. Defaults to 60.
+
+wait_aging_max_boost
+  Maximum extra scheduling weight a single waiting task can accumulate,
+  bounding how far aging can move a task past fresh high-priority work.
+  Defaults to 10.
+
 metrics_collector
   Optional setting allowing Luigi to use a contribution to collect metrics
   about the pipeline to a third-party. By default this uses the default metric

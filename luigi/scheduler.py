@@ -137,6 +137,19 @@ class scheduler(Config):
 
     send_messages = parameter.BoolParameter(default=True)
 
+    wait_aging_enabled = parameter.BoolParameter(
+        default=False,
+        description="When true, runnable tasks gain extra scheduling weight the longer they wait",
+    )
+    wait_aging_step = parameter.IntParameter(
+        default=60,
+        description="Seconds of runnable wait time required per point of extra scheduling weight",
+    )
+    wait_aging_max_boost = parameter.IntParameter(
+        default=10,
+        description="Maximum extra scheduling weight a runnable task can accumulate while waiting",
+    )
+
     metrics_collector = parameter.EnumParameter(enum=MetricsCollectors, default=MetricsCollectors.default)
     metrics_custom_import = parameter.OptionalStrParameter(default=None)
 
@@ -280,6 +293,10 @@ class Task:
         self.runnable = False
         self.batchable = False
         self.batch_id = None
+        # Start of the current uninterrupted runnable waiting episode and its
+        # stable identity. Both are persisted so aging survives state reload.
+        self.runnable_wait_since = None
+        self.runnable_wait_id = None
 
     def __repr__(self):
         return "Task(%r)" % vars(self)
@@ -1080,7 +1097,49 @@ class Scheduler:
         :return:
         """
 
-        return task.priority, -task.time
+        return task.priority + self._wait_boost(task), -task.time
+
+    def _wait_boost(self, task):
+        """
+        Extra scheduling weight accumulated during the current runnable wait.
+
+        Only time spent PENDING with all dependencies DONE counts; time blocked
+        on unfinished dependencies, time spent running and retry delays are
+        excluded. Disabled aging keeps the original priority-based ordering.
+        """
+        if not self._config.wait_aging_enabled:
+            return 0
+        wait_since = getattr(task, "runnable_wait_since", None)
+        if wait_since is None:
+            return 0
+        waited = max(0, time.time() - wait_since)
+        boost = int(waited // self._config.wait_aging_step)
+        return min(boost, self._config.wait_aging_max_boost)
+
+    def _refresh_wait_episode(self, task):
+        """
+        Track the contiguous period a PENDING task is runnable.
+
+        A wait episode starts the first time the task becomes schedulable and
+        is reset whenever it stops being runnable, so unfinished dependencies do
+        not count toward aging. The episode id stays fixed for one episode and
+        is persisted alongside the task.
+        """
+        if not self._config.wait_aging_enabled:
+            return
+        if not hasattr(task, "runnable_wait_since"):
+            task.runnable_wait_since = None
+            task.runnable_wait_id = None
+        if task.status == PENDING and self._schedulable(task):
+            if task.runnable_wait_since is None:
+                task.runnable_wait_since = time.time()
+                task.runnable_wait_id = uuid.uuid4().hex
+        elif task.runnable_wait_since is not None:
+            self._clear_wait_episode(task)
+
+    def _clear_wait_episode(self, task):
+        task.runnable_wait_since = None
+        task.runnable_wait_id = None
 
     def _schedulable(self, task):
         if task.status != PENDING:
@@ -1197,8 +1256,14 @@ class Scheduler:
             active_workers = self._state.get_active_workers(last_get_work_gt=activity_limit)
             greedy_workers = dict((worker.id, worker.info.get("workers", 1)) for worker in active_workers)
         tasks = list(relevant_tasks)
+        for task in tasks:
+            self._refresh_wait_episode(task)
         tasks.sort(key=self._rank, reverse=True)
 
+        # Highest effective rank among this worker's own runnable tasks scanned
+        # so far. With aging enabled, greedy reservations only make sense for
+        # tasks that outrank it, so an aged task keeps its claim on resources.
+        best_eligible_rank = None
         for task in tasks:
             if (
                 best_task
@@ -1221,9 +1286,28 @@ class Scheduler:
                 for resource, amount in (getattr(task, "resources_running", task.resources) or {}).items():
                     greedy_resources[resource] += amount
 
+            in_workers = (assistant and task.runnable) or worker_id in task.workers
+            if (
+                self._config.wait_aging_enabled
+                and in_workers
+                and self._schedulable(task)
+                and (best_eligible_rank is None or self._rank(task) > best_eligible_rank)
+            ):
+                best_eligible_rank = self._rank(task)
+
             if self._schedulable(task) and self._has_resources(task.resources, greedy_resources):
-                in_workers = (assistant and task.runnable) or worker_id in task.workers
-                if in_workers and self._has_resources(task.resources, used_resources):
+                can_run_now = in_workers and self._has_resources(task.resources, used_resources)
+                blocks_lower_ranked = (
+                    self._config.wait_aging_enabled
+                    and can_run_now
+                    and best_eligible_rank is not None
+                    and self._rank(task) < best_eligible_rank
+                )
+                if blocks_lower_ranked:
+                    # A higher-ranked task of this worker is already waiting
+                    # for resources; don't let a lower-ranked one take them.
+                    can_run_now = False
+                if can_run_now:
                     best_task = task
                     batch_param_names, max_batch_size = self._state.get_batcher(worker_id, task.family)
                     if batch_param_names and task.is_batchable():
@@ -1236,7 +1320,17 @@ class Scheduler:
                 else:
                     workers = itertools.chain(task.workers, [worker_id]) if assistant else task.workers
                     for task_worker in workers:
-                        if greedy_workers.get(task_worker, 0) > 0:
+                        reserve = greedy_workers.get(task_worker, 0) > 0
+                        if self._config.wait_aging_enabled:
+                            # Do not hoard capacity for tasks ranked below the
+                            # worker's best eligible task; otherwise waiting
+                            # tasks could never age into their resources.
+                            reserve = (
+                                reserve
+                                and best_eligible_rank is not None
+                                and self._rank(task) > best_eligible_rank
+                            )
+                        if reserve:
                             # use up a worker
                             greedy_workers[task_worker] -= 1
 
@@ -1252,6 +1346,7 @@ class Scheduler:
             batch_string = "|".join(task.id for task in batched_tasks)
             batch_id = hashlib.new("md5", batch_string.encode("utf-8"), usedforsecurity=False).hexdigest()
             for task in batched_tasks:
+                self._clear_wait_episode(task)
                 self._state.set_batch_running(task, batch_id, worker_id)
 
             combined_params = best_task.params.copy()
@@ -1266,6 +1361,7 @@ class Scheduler:
 
         elif best_task:
             self.update_metrics_task_started(best_task)
+            self._clear_wait_episode(best_task)
             self._state.set_status(best_task, RUNNING, self._config)
             best_task.worker_running = worker_id
             best_task.resources_running = best_task.resources.copy()
