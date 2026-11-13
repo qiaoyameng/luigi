@@ -48,11 +48,24 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 
 from luigi import notifications
 from luigi.event import Event
 from luigi.parameter import BoolParameter, FloatParameter, IntParameter, OptionalParameter, Parameter, TimeDeltaParameter
-from luigi.scheduler import DISABLED, DONE, FAILED, PENDING, UNKNOWN, WORKER_STATE_ACTIVE, WORKER_STATE_DISABLED, RetryPolicy, Scheduler
+from luigi.scheduler import (
+    ATTEMPT_LEASE_MODE_LEASE,
+    ATTEMPT_LEASE_MODE_LEGACY,
+    DISABLED,
+    DONE,
+    FAILED,
+    PENDING,
+    UNKNOWN,
+    WORKER_STATE_ACTIVE,
+    WORKER_STATE_DISABLED,
+    RetryPolicy,
+    Scheduler,
+)
 from luigi.target import Target
 from luigi.task import Config, DynamicRequirements, Task, flatten
 from luigi.task_register import TaskClassException, load_task
@@ -317,26 +330,33 @@ class TaskStatusReporter:
     where fork method needs to pickle the process object (e.g.  Windows).
     """
 
-    def __init__(self, scheduler, task_id, worker_id, scheduler_messages):
+    def __init__(self, scheduler, task_id, worker_id, scheduler_messages, attempt_id=None):
         self._task_id = task_id
         self._worker_id = worker_id
         self._scheduler = scheduler
         self.scheduler_messages = scheduler_messages
+        self.attempt_id = attempt_id
 
     def update_tracking_url(self, tracking_url):
-        self._scheduler.add_task(task_id=self._task_id, worker=self._worker_id, status=RUNNING, tracking_url=tracking_url)
+        self._scheduler.add_task(
+            task_id=self._task_id,
+            worker=self._worker_id,
+            status=RUNNING,
+            tracking_url=tracking_url,
+            attempt_id=self.attempt_id,
+        )
 
     def update_status_message(self, message):
-        self._scheduler.set_task_status_message(self._task_id, message)
+        self._scheduler.set_task_status_message(self._task_id, message, attempt_id=self.attempt_id)
 
     def update_progress_percentage(self, percentage):
-        self._scheduler.set_task_progress_percentage(self._task_id, percentage)
+        self._scheduler.set_task_progress_percentage(self._task_id, percentage, attempt_id=self.attempt_id)
 
     def decrease_running_resources(self, decrease_resources):
-        self._scheduler.decrease_running_task_resources(self._task_id, decrease_resources)
+        self._scheduler.decrease_running_task_resources(self._task_id, decrease_resources, attempt_id=self.attempt_id)
 
     def report_task_statistics(self, statistics):
-        self._scheduler.report_task_statistics(self._task_id, statistics)
+        self._scheduler.report_task_statistics(self._task_id, statistics, attempt_id=self.attempt_id)
 
 
 class SchedulerMessage:
@@ -345,12 +365,13 @@ class SchedulerMessage:
     received and passed to the message queue of a :py:class:`Task`.
     """
 
-    def __init__(self, scheduler, task_id, message_id, content, **payload):
+    def __init__(self, scheduler, task_id, message_id, content, attempt_id=None, **payload):
         super(SchedulerMessage, self).__init__()
 
         self._scheduler = scheduler
         self._task_id = task_id
         self._message_id = message_id
+        self._attempt_id = attempt_id
 
         self.content = content
         self.payload = payload
@@ -362,7 +383,7 @@ class SchedulerMessage:
         return self.content == other
 
     def respond(self, response):
-        self._scheduler.add_scheduler_message_response(self._task_id, self._message_id, response)
+        self._scheduler.add_scheduler_message_response(self._task_id, self._message_id, response, attempt_id=self._attempt_id)
 
 
 class SingleProcessPool:
@@ -500,13 +521,15 @@ class KeepAliveThread(threading.Thread):
     Periodically tell the scheduler that the worker still lives.
     """
 
-    def __init__(self, scheduler, worker_id, ping_interval, rpc_message_callback):
+    def __init__(self, scheduler, worker_id, ping_interval, rpc_message_callback, client_id=None, attempt_leases=None):
         super(KeepAliveThread, self).__init__()
         self._should_stop = threading.Event()
         self._scheduler = scheduler
         self._worker_id = worker_id
         self._ping_interval = ping_interval
         self._rpc_message_callback = rpc_message_callback
+        self._client_id = client_id
+        self._attempt_leases = attempt_leases or (lambda: {})
 
     def stop(self):
         self._should_stop.set()
@@ -520,7 +543,14 @@ class KeepAliveThread(threading.Thread):
             with fork_lock:
                 response = None
                 try:
-                    response = self._scheduler.ping(worker=self._worker_id)
+                    try:
+                        response = self._scheduler.ping(
+                            worker=self._worker_id,
+                            client_id=self._client_id,
+                            attempt_leases=self._attempt_leases(),
+                        )
+                    except TypeError:
+                        response = self._scheduler.ping(worker=self._worker_id)
                 except BaseException:  # httplib.BadStatusLine:
                     logger.warning("Failed pinging scheduler")
 
@@ -563,6 +593,9 @@ class Worker:
         self._scheduler = scheduler
         self._assistant = assistant
         self._stop_requesting_work = False
+        self._client_id = uuid.uuid4().hex
+        self._attempt_lease_mode = ATTEMPT_LEASE_MODE_LEGACY
+        self._attempt_leases = {}
 
         self.host = socket.gethostname()
         self._scheduled_tasks = {}
@@ -620,6 +653,11 @@ class Worker:
         if task and kwargs.get("params"):
             kwargs["param_visibilities"] = task._get_param_visibilities()
 
+        if kwargs.get("attempt_id") is None:
+            attempt_id = self._attempt_leases.get(task_id)
+            if attempt_id is not None:
+                kwargs["attempt_id"] = attempt_id
+
         self._scheduler.add_task(*args, **kwargs)
 
         logger.info("Informed scheduler that task   %s   has status   %s", task_id, status)
@@ -628,7 +666,14 @@ class Worker:
         """
         Start the KeepAliveThread.
         """
-        self._keep_alive_thread = KeepAliveThread(self._scheduler, self._id, self._config.ping_interval, self._handle_rpc_message)
+        self._keep_alive_thread = KeepAliveThread(
+            self._scheduler,
+            self._id,
+            self._config.ping_interval,
+            self._handle_rpc_message,
+            client_id=self._client_id,
+            attempt_leases=lambda: dict(self._attempt_leases),
+        )
         self._keep_alive_thread.daemon = True
         self._keep_alive_thread.start()
         return self
@@ -928,7 +973,24 @@ class Worker:
 
     def _add_worker(self):
         self._worker_info.append(("first_task", self._first_task))
-        self._scheduler.add_worker(self._id, self._worker_info)
+        try:
+            response = self._scheduler.add_worker(
+                self._id,
+                self._worker_info,
+                client_id=self._client_id,
+                attempt_lease_support=True,
+            )
+        except TypeError:
+            # Older custom schedulers do not understand the handshake
+            # extensions. Treat them as explicitly legacy, never as protected.
+            response = self._scheduler.add_worker(self._id, self._worker_info)
+
+        if isinstance(response, dict):
+            self._attempt_lease_mode = response.get("attempt_lease_mode", ATTEMPT_LEASE_MODE_LEGACY)
+        else:
+            self._attempt_lease_mode = ATTEMPT_LEASE_MODE_LEGACY
+        if self._attempt_lease_mode != ATTEMPT_LEASE_MODE_LEASE:
+            logger.warning("Scheduler does not support attempt leases; running in legacy mode without lease protection")
 
     def _log_remote_tasks(self, get_work_response):
         logger.debug("Done")
@@ -943,7 +1005,7 @@ class Worker:
             if get_work_response.n_pending_last_scheduled:
                 logger.debug("There are %i pending tasks last scheduled by this worker", get_work_response.n_pending_last_scheduled)
 
-    def _get_work_task_id(self, get_work_response):
+    def _get_work_task_id(self, get_work_response, attempt_id=None):
         if get_work_response.get("task_id") is not None:
             return get_work_response["task_id"]
         elif "batch_id" in get_work_response:
@@ -954,6 +1016,9 @@ class Worker:
                     params_str=get_work_response["task_params"],
                 )
             except Exception as ex:
+                if attempt_id is not None:
+                    for batch_task_id in get_work_response["batch_task_ids"]:
+                        self._attempt_leases[batch_task_id] = attempt_id
                 self._handle_task_load_error(ex, get_work_response["batch_task_ids"])
                 self.run_succeeded = False
                 return None
@@ -966,6 +1031,7 @@ class Worker:
                 params=task.to_str_params(),
                 status=RUNNING,
                 batch_id=get_work_response["batch_id"],
+                attempt_id=attempt_id,
             )
             return task.task_id
         else:
@@ -988,12 +1054,17 @@ class Worker:
             r = self._scheduler.count_pending(worker=self._id)
 
         running_tasks = r["running_tasks"]
-        task_id = self._get_work_task_id(r)
+        attempt_id = r.get("attempt_id")
+        task_id = self._get_work_task_id(r, attempt_id=attempt_id)
+
+        if task_id is not None and attempt_id is not None:
+            self._attempt_leases[task_id] = attempt_id
 
         self._get_work_response_history.append(
             {
                 "task_id": task_id,
                 "running_tasks": running_tasks,
+                "attempt_id": attempt_id,
             }
         )
 
@@ -1044,7 +1115,13 @@ class Worker:
 
     def _create_task_process(self, task):
         message_queue = multiprocessing.Queue() if task.accepts_messages else None
-        reporter = TaskStatusReporter(self._scheduler, task.task_id, self._id, message_queue)
+        reporter = TaskStatusReporter(
+            self._scheduler,
+            task.task_id,
+            self._id,
+            message_queue,
+            attempt_id=self._attempt_leases.get(task.task_id),
+        )
         use_multiprocessing = self._config.force_multiprocessing or bool(self.worker_processes > 1)
         return ContextManagedTaskProcess(
             self._config.task_process_context,
@@ -1131,6 +1208,8 @@ class Worker:
             )
 
             self._running_tasks.pop(task_id)
+            if status in (DONE, FAILED, PENDING):
+                self._attempt_leases.pop(task_id, None)
 
             # re-add task to reschedule missing dependencies
             if missing:
@@ -1271,7 +1350,15 @@ class Worker:
         self.worker_processes = max(1, n)
 
         # tell the scheduler
-        self._scheduler.add_worker(self._id, {"workers": self.worker_processes})
+        try:
+            self._scheduler.add_worker(
+                self._id,
+                {"workers": self.worker_processes},
+                client_id=self._client_id,
+                attempt_lease_support=self._attempt_lease_mode == ATTEMPT_LEASE_MODE_LEASE,
+            )
+        except TypeError:
+            self._scheduler.add_worker(self._id, {"workers": self.worker_processes})
 
     @rpc_message_callback
     def dispatch_scheduler_message(self, task_id, message_id, content, **kwargs):
@@ -1279,5 +1366,12 @@ class Worker:
         if task_id in self._running_tasks:
             task_process = self._running_tasks[task_id]
             if task_process.status_reporter.scheduler_messages:
-                message = SchedulerMessage(self._scheduler, task_id, message_id, content, **kwargs)
+                message = SchedulerMessage(
+                    self._scheduler,
+                    task_id,
+                    message_id,
+                    content,
+                    attempt_id=task_process.status_reporter.attempt_id,
+                    **kwargs,
+                )
                 task_process.status_reporter.scheduler_messages.put(message)

@@ -69,6 +69,9 @@ STATUS_TO_UPSTREAM_MAP = {
 WORKER_STATE_DISABLED = "disabled"
 WORKER_STATE_ACTIVE = "active"
 
+ATTEMPT_LEASE_MODE_LEASE = "lease"
+ATTEMPT_LEASE_MODE_LEGACY = "legacy"
+
 TASK_FAMILY_RE = re.compile(r"([^(_]+)[(_]")
 
 RPC_METHODS = {}
@@ -258,6 +261,15 @@ class Task:
         self.remove = None
         self.worker_running = None  # the worker id that is currently running the task or None
         self.time_running = None  # Timestamp when picked up by worker
+        # Attempt leases bind allocation, heartbeats and every status report to
+        # one concrete execution attempt. The token is opaque to workers.
+        self.attempt_id = None
+        self.attempt_worker = None
+        self.attempt_started = None
+        self.attempt_heartbeat = None
+        self.attempt_terminal_status = None
+        self.revoked_attempt_ids = set()
+        self.resource_decrease_reports = set()
         self.expl = None
         self.priority = priority
         self.resources = _get_default(resources, {})
@@ -363,9 +375,18 @@ class Worker:
         self.info = {}
         self.disabled = False
         self.rpc_messages = []
+        # A client_id identifies one Worker incarnation. Re-registering the
+        # same worker name with a different client_id starts a new identity.
+        self.client_id = None
+        self.attempt_lease_support = None
+        self.attempt_lease_mode = ATTEMPT_LEASE_MODE_LEGACY
 
     def add_info(self, info):
         self.info.update(info)
+
+    @property
+    def supports_attempt_leases(self):
+        return self.attempt_lease_mode == ATTEMPT_LEASE_MODE_LEASE
 
     def update(self, worker_reference, get_work=False):
         if worker_reference:
@@ -382,7 +403,7 @@ class Worker:
     def get_tasks(self, state, *statuses):
         num_self_tasks = len(self.tasks)
         num_state_tasks = sum(len(state._status_tasks[status]) for status in statuses)
-        if num_self_tasks < num_state_tasks:
+        if num_self_tasks and num_self_tasks < num_state_tasks:
             return filter(lambda task: task.status in statuses, self.tasks)
         else:
             return filter(lambda task: self.id in task.workers, state.get_active_tasks_by_status(*statuses))
@@ -525,10 +546,16 @@ class SimpleTaskState:
             self.set_status(task, FAILED, config)
             task.clear_failures()
 
-    def set_batch_running(self, task, batch_id, worker_id):
+    def set_batch_running(self, task, batch_id, worker_id, attempt_id=None):
         self.set_status(task, BATCH_RUNNING)
         task.batch_id = batch_id
         task.worker_running = worker_id
+        if attempt_id is not None:
+            task.attempt_id = attempt_id
+            task.attempt_worker = worker_id
+            task.attempt_started = task.attempt_started or time.time()
+            task.attempt_heartbeat = time.time()
+            task.attempt_terminal_status = None
         task.resources_running = task.resources
         task.time_running = time.time()
 
@@ -613,6 +640,7 @@ class SimpleTaskState:
 
         # Reset FAILED tasks to PENDING if max timeout is reached, and retry delay is >= 0
         if task.status == FAILED and config.retry_delay >= 0 and task.retry < time.time():
+            self.revoke_attempt(task)
             self.set_status(task, PENDING, config)
 
     def may_prune(self, task):
@@ -649,6 +677,27 @@ class SimpleTaskState:
         for worker in delete_workers:
             self._active_workers.pop(worker)
         self._remove_workers_from_tasks(delete_workers)
+
+    def revoke_attempt(self, task):
+        """Revoke the current attempt lease for a task and return its identity."""
+        attempt_id = task.attempt_id
+        attempt_worker = task.attempt_worker
+        if attempt_id is None:
+            return None
+        task.revoked_attempt_ids.add(attempt_id)
+        if len(task.revoked_attempt_ids) > 1000:
+            task.revoked_attempt_ids.pop()
+        task.attempt_id = None
+        task.attempt_worker = None
+        task.attempt_heartbeat = None
+        return attempt_id, attempt_worker
+
+    def revoke_worker_attempts(self, worker_id):
+        revoked = []
+        for task in self.get_active_tasks():
+            if task.attempt_id is not None and task.attempt_worker == worker_id:
+                revoked.append((task, self.revoke_attempt(task)))
+        return revoked
 
     def _remove_workers_from_tasks(self, workers, remove_stakeholders=True):
         for task in self.get_active_tasks():
@@ -701,6 +750,8 @@ class Scheduler:
         self._make_task = functools.partial(Task, retry_policy=self._config._get_retry_policy())
         self._worker_requests = {}
         self._paused = False
+        self._attempt_epoch = uuid.uuid4().hex
+        self._attempt_diagnostics = collections.deque(maxlen=10000)
 
         if self._config.batch_emails:
             self._email_batcher = BatchNotifier()
@@ -709,11 +760,111 @@ class Scheduler:
 
     def load(self):
         self._state.load()
+        self._reset_attempts_after_reload()
 
     def dump(self):
         self._state.dump()
         if self._config.batch_emails:
             self._email_batcher.send_email()
+
+    def _record_attempt_event(self, task, action, attempt_id=None, worker=None, status=None, reason=None, accepted=None):
+        event = {
+            "task_id": getattr(task, "id", task),
+            "attempt_id": attempt_id,
+            "worker": worker,
+            "action": action,
+            "status": status,
+            "reason": reason,
+            "accepted": accepted,
+            "time": time.time(),
+        }
+        self._attempt_diagnostics.append(event)
+        return event
+
+    def _revoke_task_attempt(self, task, reason):
+        revoked = self._state.revoke_attempt(task)
+        if revoked is None:
+            return None
+        attempt_id, worker = revoked
+        self._record_attempt_event(task, "attempt_revoked", attempt_id, worker, reason=reason, accepted=False)
+        return attempt_id, worker
+
+    def _invalidate_worker_attempts(self, worker_id, reason, reset_status=True):
+        for task, revoked in self._state.revoke_worker_attempts(worker_id):
+            if revoked is None:
+                continue
+            attempt_id, attempt_worker = revoked
+            self._record_attempt_event(task, "attempt_revoked", attempt_id, attempt_worker, reason=reason, accepted=False)
+            if reset_status and task.status in (RUNNING, BATCH_RUNNING):
+                task.worker_running = None
+                task.time_running = None
+                if task.batch_id is not None:
+                    task.batch_id = None
+                self._state.set_status(task, PENDING, self._config)
+
+    def _reset_attempts_after_reload(self):
+        # Persisted worker identities and lease tokens belong to the previous
+        # scheduler incarnation. Never let a reconnecting client adopt them.
+        self._attempt_epoch = uuid.uuid4().hex
+        self._state._active_workers.clear()
+
+        for task in list(self._state.get_active_tasks()):
+            for name, default in (
+                ("attempt_id", None),
+                ("attempt_worker", None),
+                ("attempt_started", None),
+                ("attempt_heartbeat", None),
+                ("attempt_terminal_status", None),
+                ("revoked_attempt_ids", set()),
+                ("resource_decrease_reports", set()),
+            ):
+                if not hasattr(task, name):
+                    setattr(task, name, default)
+            if task.status in (RUNNING, BATCH_RUNNING):
+                if task.attempt_id is not None:
+                    self._revoke_task_attempt(task, "scheduler_reload")
+                    task.worker_running = None
+                    task.time_running = None
+                    task.batch_id = None
+                    self._state.set_status(task, PENDING, self._config)
+                else:
+                    # Legacy in-flight work cannot be safely adopted either.
+                    task.worker_running = None
+                    task.time_running = None
+                    task.batch_id = None
+                    self._state.set_status(task, FAILED, self._config)
+
+    def _register_worker_identity(self, worker_id, client_id=None, attempt_lease_support=None, info=None):
+        existing = self._state._active_workers.get(worker_id)
+        if (
+            existing is not None
+            and client_id is not None
+            and existing.client_id is not None
+            and existing.client_id != client_id
+        ):
+            self._invalidate_worker_attempts(worker_id, "worker_reregistered")
+
+        worker = self._state.get_worker(worker_id)
+        if client_id is not None:
+            worker.client_id = client_id
+        if attempt_lease_support is not None:
+            worker.attempt_lease_support = bool(attempt_lease_support)
+            worker.attempt_lease_mode = ATTEMPT_LEASE_MODE_LEASE if attempt_lease_support else ATTEMPT_LEASE_MODE_LEGACY
+        elif existing is None or existing.attempt_lease_support is None:
+            # No explicit declaration means the client is not protected by
+            # attempt leases. This is a deliberate, visible legacy mode.
+            worker.attempt_lease_support = None
+            worker.attempt_lease_mode = ATTEMPT_LEASE_MODE_LEGACY
+        if info is not None:
+            worker.add_info(info)
+        return worker
+
+    def _handshake_reply(self, worker):
+        return {
+            "attempt_lease_support": worker.attempt_lease_support,
+            "attempt_lease_mode": worker.attempt_lease_mode,
+            "scheduler_generation": self._attempt_epoch,
+        }
 
     @rpc_method()
     def prune(self):
@@ -730,6 +881,8 @@ class Scheduler:
                 logger.debug("Worker %s timed out (no contact for >=%ss)", worker, self._config.worker_disconnect_delay)
                 remove_workers.append(worker.id)
 
+        for worker_id in remove_workers:
+            self._invalidate_worker_attempts(worker_id, "worker_disconnected", reset_status=False)
         self._state.inactivate_workers(remove_workers)
 
     def _prune_tasks(self):
@@ -755,6 +908,80 @@ class Scheduler:
         worker = self._state.get_worker(worker_id)
         worker.update(worker_reference, get_work=get_work)
         return worker
+
+    def _attempt_report_valid(self, task, worker_id, attempt_id, status, batch_id=None):
+        current = []
+        if task.attempt_id is not None:
+            current.append((task.attempt_id, task.attempt_worker))
+        if batch_id is not None and self._state.has_task(task.id):
+            for batch_task in self._state.get_batch_running_tasks(batch_id):
+                if batch_task.attempt_id is not None:
+                    current.append((batch_task.attempt_id, batch_task.attempt_worker))
+
+        worker = self._state._active_workers.get(worker_id)
+        lease_mode = worker.supports_attempt_leases if worker is not None else False
+
+        if attempt_id is not None:
+            if attempt_id in task.revoked_attempt_ids:
+                return False, "attempt_lease_revoked", None
+            for current_id, current_worker in current:
+                if current_id == attempt_id and current_worker == worker_id:
+                    return True, None, current_id
+            return False, "attempt_lease_not_current", None
+
+        if current:
+            if lease_mode and status == PENDING and task.attempt_terminal_status in (DONE, FAILED):
+                # Re-scheduling after a terminal report starts a fresh attempt
+                # later; the completed lease must not be adopted again.
+                if any(current_worker == worker_id for _, current_worker in current):
+                    return True, None, None
+            return False, "attempt_lease_missing", None
+
+        if lease_mode and status in (RUNNING, BATCH_RUNNING):
+            return False, "attempt_lease_missing", None
+        return True, None, None
+
+    def _start_attempt(self, task, worker_id, batch_id=None):
+        if task.attempt_id is not None:
+            self._revoke_task_attempt(task, "attempt_replaced")
+        attempt_id = uuid.uuid4().hex
+        task.attempt_id = attempt_id
+        task.attempt_worker = worker_id
+        task.attempt_started = time.time()
+        task.attempt_heartbeat = task.attempt_started
+        task.attempt_terminal_status = None
+        task.resource_decrease_reports.clear()
+        self._record_attempt_event(task, "attempt_assigned", attempt_id, worker_id, reason=batch_id, accepted=True)
+        return attempt_id
+
+    def _ensure_attempt(self, task, worker_id, batch_id=None):
+        worker = self._state._active_workers.get(worker_id)
+        if worker is None or not worker.supports_attempt_leases:
+            return None
+        if (
+            task.attempt_id is not None
+            and task.attempt_worker == worker_id
+            and task.status in (RUNNING, BATCH_RUNNING)
+        ):
+            task.attempt_heartbeat = time.time()
+            return task.attempt_id
+        return self._start_attempt(task, worker_id, batch_id=batch_id)
+
+    def _attempt_token_is_current(self, task, attempt_id):
+        current = []
+        if task.attempt_id is not None:
+            current.append(task.attempt_id)
+        if task.batch_id is not None:
+            for batch_task in self._state.get_batch_running_tasks(task.batch_id):
+                if batch_task.attempt_id is not None:
+                    current.append(batch_task.attempt_id)
+        if attempt_id is None:
+            return not current, "attempt_lease_missing" if current else None
+        if attempt_id in task.revoked_attempt_ids:
+            return False, "attempt_lease_revoked"
+        if attempt_id in current:
+            return True, None
+        return False, "attempt_lease_not_current"
 
     def _update_priority(self, task, prio, worker):
         """
@@ -822,6 +1049,7 @@ class Scheduler:
         worker=None,
         batchable=None,
         batch_id=None,
+        attempt_id=None,
         retry_policy_dict=None,
         owners=None,
         **kwargs,
@@ -844,6 +1072,24 @@ class Scheduler:
 
         retry_policy = self._generate_retry_policy(retry_policy_dict)
 
+        if attempt_id is not None and batch_id is None and not self._state.has_task(task_id):
+            self._record_attempt_event(
+                task_id,
+                "report_rejected",
+                attempt_id=attempt_id,
+                worker=worker_id,
+                status=status,
+                reason="attempt_lease_not_current",
+                accepted=False,
+            )
+            return {
+                "task_id": task_id,
+                "status": None,
+                "attempt_id": None,
+                "accepted": False,
+                "reason": "attempt_lease_not_current",
+            }
+
         if worker.enabled:
             _default_task = self._make_task(
                 task_id=task_id,
@@ -863,6 +1109,65 @@ class Scheduler:
 
         if task is None or (task.status != RUNNING and not worker.enabled):
             return
+
+        attempt_valid, attempt_reason, current_attempt = self._attempt_report_valid(task, worker_id, attempt_id, status, batch_id)
+        if not attempt_valid:
+            self._record_attempt_event(
+                task,
+                "report_rejected",
+                attempt_id=attempt_id,
+                worker=worker_id,
+                status=status,
+                reason=attempt_reason,
+                accepted=False,
+            )
+            return {
+                "task_id": task.id,
+                "status": task.status,
+                "attempt_id": task.attempt_id,
+                "accepted": False,
+                "reason": attempt_reason,
+            }
+
+        # A batch runner can report through a synthetic task id. Adopt the
+        # lease shared by the batch so its later updates stay bound too.
+        if current_attempt is not None and task.attempt_id is None:
+            task.attempt_id = current_attempt
+            task.attempt_worker = worker_id
+            task.attempt_started = task.attempt_started or time.time()
+            task.attempt_heartbeat = time.time()
+            task.attempt_terminal_status = None
+
+        if attempt_id is not None and task.attempt_id == attempt_id and task.attempt_terminal_status is not None:
+            # Replays of an accepted terminal report are safe no-ops. A
+            # conflicting terminal report from the same attempt is diagnostic
+            # only as well.
+            duplicate = task.attempt_terminal_status == status
+            self._record_attempt_event(
+                task,
+                "duplicate_report" if duplicate else "report_rejected",
+                attempt_id=attempt_id,
+                worker=worker_id,
+                status=status,
+                reason="duplicate" if duplicate else "attempt_terminal_conflict",
+                accepted=duplicate,
+            )
+            if duplicate:
+                return {
+                    "task_id": task.id,
+                    "status": task.status,
+                    "attempt_id": task.attempt_id,
+                    "accepted": True,
+                    "duplicate": True,
+                }
+            if status in (DONE, FAILED, BATCH_RUNNING):
+                return {
+                    "task_id": task.id,
+                    "status": task.status,
+                    "attempt_id": task.attempt_id,
+                    "accepted": False,
+                    "reason": "attempt_terminal_conflict",
+                }
 
         # Ignore claims that the task is PENDING if it very recently was marked as DONE.
         if status == PENDING and task.status == DONE and (time.time() - task.updated) < self._config.stable_done_cooldown_secs:
@@ -912,6 +1217,7 @@ class Scheduler:
         task_is_not_running = task.status not in (RUNNING, BATCH_RUNNING)
         task_started_a_run = status in (DONE, FAILED, RUNNING)
         running_on_this_worker = task.worker_running == worker_id
+        previous_status = task.status
         if task_is_not_running or (task_started_a_run and running_on_this_worker) or new_deps:
             # don't allow re-scheduling of task while it is running, it must either fail or succeed on the worker actually running it
             if status != task.status or status == PENDING:
@@ -920,6 +1226,12 @@ class Scheduler:
                 # (so checking for status != task.status woule lie)
                 self._update_task_history(task, status)
             self._state.set_status(task, PENDING if status == SUSPENDED else status, self._config)
+
+        if task.status != previous_status:
+            if task.status in (DONE, FAILED):
+                task.attempt_terminal_status = task.status
+            elif task.status == PENDING and task.attempt_id is not None:
+                self._revoke_task_attempt(task, "attempt_returned_to_pending")
 
         if status == FAILED and self._config.batch_emails:
             batched_params, _ = self._state.get_batcher(worker_id, family)
@@ -965,6 +1277,13 @@ class Scheduler:
             self._state.get_worker(worker_id).tasks.add(task)
             task.runnable = runnable
 
+        return {
+            "task_id": task.id,
+            "status": task.status,
+            "attempt_id": task.attempt_id,
+            "accepted": True,
+        }
+
     @rpc_method()
     def announce_scheduling_failure(self, task_name, family, params, expl, owners, **kwargs):
         if not self._config.batch_emails:
@@ -978,8 +1297,9 @@ class Scheduler:
         self._email_batcher.add_scheduling_fail(task_name, family, unbatched_params, expl, owners)
 
     @rpc_method()
-    def add_worker(self, worker, info, **kwargs):
-        self._state.get_worker(worker).add_info(info)
+    def add_worker(self, worker, info, client_id=None, attempt_lease_support=None, **kwargs):
+        worker = self._register_worker_identity(worker, client_id=client_id, attempt_lease_support=attempt_lease_support, info=info)
+        return self._handshake_reply(worker)
 
     @rpc_method()
     def disable_worker(self, worker):
@@ -1000,9 +1320,13 @@ class Scheduler:
         return {"message_id": message_id}
 
     @rpc_method()
-    def add_scheduler_message_response(self, task_id, message_id, response):
+    def add_scheduler_message_response(self, task_id, message_id, response, attempt_id=None):
         if self._state.has_task(task_id):
             task = self._state.get_task(task_id)
+            valid, reason = self._attempt_token_is_current(task, attempt_id)
+            if not valid:
+                self._record_attempt_event(task, "report_rejected", attempt_id, status="scheduler_message_response", reason=reason, accepted=False)
+                return
             task.scheduler_message_responses[message_id] = response
 
     @rpc_method()
@@ -1099,6 +1423,7 @@ class Scheduler:
             if task.worker_running == worker_id and task.batch_id not in running_batch_ids
         ]
         for task in orphaned_tasks:
+            self._revoke_task_attempt(task, "orphaned_batch")
             self._state.set_status(task, PENDING)
 
     @rpc_method()
@@ -1136,7 +1461,7 @@ class Scheduler:
         }
 
     @rpc_method(allow_null=False)
-    def get_work(self, host=None, assistant=False, current_tasks=None, worker=None, **kwargs):
+    def get_work(self, host=None, assistant=False, current_tasks=None, worker=None, client_id=None, attempt_lease_support=None, **kwargs):
         # TODO: remove any expired nodes
 
         # Algo: iterate over all nodes, find the highest priority node no dependencies and available
@@ -1155,7 +1480,10 @@ class Scheduler:
 
         assert worker is not None
         worker_id = worker
+        if client_id is not None or attempt_lease_support is not None:
+            self._register_worker_identity(worker_id, client_id=client_id, attempt_lease_support=attempt_lease_support)
         worker = self._update_worker(worker_id, worker_reference={"host": host}, get_work=True)
+        lease_mode = worker.supports_attempt_leases
         if not worker.enabled:
             reply = {
                 "n_pending_tasks": 0,
@@ -1164,10 +1492,12 @@ class Scheduler:
                 "n_unique_pending": 0,
                 "worker_state": worker.state,
             }
+            if lease_mode:
+                reply.update(self._handshake_reply(worker))
             return reply
 
         if assistant:
-            self.add_worker(worker_id, [("assistant", assistant)])
+            worker.add_info([("assistant", assistant)])
 
         batched_params, unbatched_params, batched_tasks, max_batch_size = None, None, [], 1
         best_task = None
@@ -1247,12 +1577,15 @@ class Scheduler:
                             break
 
         reply = self.count_pending(worker_id)
+        if lease_mode:
+            reply.update(self._handshake_reply(worker))
 
         if len(batched_tasks) > 1:
             batch_string = "|".join(task.id for task in batched_tasks)
             batch_id = hashlib.new("md5", batch_string.encode("utf-8"), usedforsecurity=False).hexdigest()
+            attempt_id = self._ensure_attempt(best_task, worker_id, batch_id=batch_id)
             for task in batched_tasks:
-                self._state.set_batch_running(task, batch_id, worker_id)
+                self._state.set_batch_running(task, batch_id, worker_id, attempt_id=attempt_id)
 
             combined_params = best_task.params.copy()
             combined_params.update(batched_params)
@@ -1263,8 +1596,11 @@ class Scheduler:
             reply["task_params"] = combined_params
             reply["batch_id"] = batch_id
             reply["batch_task_ids"] = [task.id for task in batched_tasks]
+            if lease_mode:
+                reply["attempt_id"] = attempt_id
 
         elif best_task:
+            attempt_id = self._ensure_attempt(best_task, worker_id)
             self.update_metrics_task_started(best_task)
             self._state.set_status(best_task, RUNNING, self._config)
             best_task.worker_running = worker_id
@@ -1276,17 +1612,58 @@ class Scheduler:
             reply["task_family"] = best_task.family
             reply["task_module"] = getattr(best_task, "module", None)
             reply["task_params"] = best_task.params
+            if lease_mode:
+                reply["attempt_id"] = attempt_id
 
         else:
             reply["task_id"] = None
+            if lease_mode:
+                reply["attempt_id"] = None
 
         return reply
 
     @rpc_method(attempts=1)
     def ping(self, **kwargs):
         worker_id = kwargs["worker"]
+        client_id = kwargs.get("client_id")
+        attempt_leases = kwargs.get("attempt_leases") or {}
+        if client_id is not None:
+            self._register_worker_identity(worker_id, client_id=client_id)
         worker = self._update_worker(worker_id)
-        return {"rpc_messages": worker.fetch_rpc_messages()}
+        now = time.time()
+        for task_id, attempt_id in attempt_leases.items():
+            task = self._state.get_task(task_id)
+            if task is None:
+                continue
+            if task.attempt_id == attempt_id and task.attempt_worker == worker_id:
+                task.attempt_heartbeat = now
+            else:
+                self._record_attempt_event(
+                    task,
+                    "heartbeat_rejected",
+                    attempt_id=attempt_id,
+                    worker=worker_id,
+                    reason="attempt_lease_not_current",
+                    accepted=False,
+                )
+        reply = {"rpc_messages": worker.fetch_rpc_messages()}
+        reply.update(self._handshake_reply(worker))
+        return reply
+
+    @rpc_method()
+    def get_attempt_diagnostics(self, task_id=None, limit=None):
+        events = list(self._attempt_diagnostics)
+        if task_id is not None:
+            events = [event for event in events if event["task_id"] == task_id]
+        if limit is not None:
+            events = events[-limit:]
+        task = self._state.get_task(task_id) if task_id is not None else None
+        return {
+            "task_id": task_id,
+            "attempt_id": getattr(task, "attempt_id", None),
+            "attempt_worker": getattr(task, "attempt_worker", None),
+            "events": events,
+        }
 
     def _upstream_status(self, task_id, upstream_status_table):
         if task_id in upstream_status_table:
@@ -1322,6 +1699,8 @@ class Scheduler:
             "status": task.status,
             "workers": list(task.workers),
             "worker_running": task.worker_running,
+            "attempt_id": getattr(task, "attempt_id", None),
+            "attempt_worker": getattr(task, "attempt_worker", None),
             "time_running": getattr(task, "time_running", None),
             "start_time": task.time,
             "last_updated": getattr(task, "updated", task.time),
@@ -1587,9 +1966,13 @@ class Scheduler:
             return {"taskId": task_id, "error": ""}
 
     @rpc_method()
-    def set_task_status_message(self, task_id, status_message):
+    def set_task_status_message(self, task_id, status_message, attempt_id=None):
         if self._state.has_task(task_id):
             task = self._state.get_task(task_id)
+            valid, reason = self._attempt_token_is_current(task, attempt_id)
+            if not valid:
+                self._record_attempt_event(task, "report_rejected", attempt_id, status="status_message", reason=reason, accepted=False)
+                return
             task.status_message = status_message
             if task.status == RUNNING and task.batch_id is not None:
                 for batch_task in self._state.get_batch_running_tasks(task.batch_id):
@@ -1604,9 +1987,13 @@ class Scheduler:
             return {"taskId": task_id, "statusMessage": ""}
 
     @rpc_method()
-    def set_task_progress_percentage(self, task_id, progress_percentage):
+    def set_task_progress_percentage(self, task_id, progress_percentage, attempt_id=None):
         if self._state.has_task(task_id):
             task = self._state.get_task(task_id)
+            valid, reason = self._attempt_token_is_current(task, attempt_id)
+            if not valid:
+                self._record_attempt_event(task, "report_rejected", attempt_id, status="progress", reason=reason, accepted=False)
+                return
             task.progress_percentage = progress_percentage
             if task.status == RUNNING and task.batch_id is not None:
                 for batch_task in self._state.get_batch_running_tasks(task.batch_id):
@@ -1621,11 +2008,28 @@ class Scheduler:
             return {"taskId": task_id, "progressPercentage": None}
 
     @rpc_method()
-    def decrease_running_task_resources(self, task_id, decrease_resources):
+    def decrease_running_task_resources(self, task_id, decrease_resources, attempt_id=None):
         if self._state.has_task(task_id):
             task = self._state.get_task(task_id)
+            valid, reason = self._attempt_token_is_current(task, attempt_id)
+            if not valid:
+                self._record_attempt_event(task, "report_rejected", attempt_id, status="resources", reason=reason, accepted=False)
+                return
             if task.status != RUNNING:
                 return
+            if attempt_id is not None:
+                report_key = (attempt_id, tuple(sorted((name, int(amount)) for name, amount in decrease_resources.items())))
+                if report_key in task.resource_decrease_reports:
+                    self._record_attempt_event(
+                        task,
+                        "duplicate_report",
+                        attempt_id,
+                        status="resources",
+                        reason="duplicate",
+                        accepted=True,
+                    )
+                    return
+                task.resource_decrease_reports.add(report_key)
 
             def decrease(resources, decrease_resources):
                 for resource, decrease_amount in decrease_resources.items():
@@ -1667,7 +2071,11 @@ class Scheduler:
         self._state._metrics_collector.handle_task_started(task)
 
     @rpc_method()
-    def report_task_statistics(self, task_id, statistics):
+    def report_task_statistics(self, task_id, statistics, attempt_id=None):
         if self._state.has_task(task_id):
             task = self._state.get_task(task_id)
+            valid, reason = self._attempt_token_is_current(task, attempt_id)
+            if not valid:
+                self._record_attempt_event(task, "report_rejected", attempt_id, status="statistics", reason=reason, accepted=False)
+                return
             self._state._metrics_collector.handle_task_statistics(task, statistics)

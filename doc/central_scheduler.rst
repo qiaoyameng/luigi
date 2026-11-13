@@ -39,6 +39,28 @@ see the :ref:`scheduler configuration section <scheduler-config>`.
 Note that ``luigid`` uses the same configuration files as the Luigi client
 (i.e. ``luigi.cfg`` or ``/etc/luigi/client.cfg`` by default).
 
+Attempt leases
+~~~~~~~~~~~~~~
+
+Every task handed out by ``get_work`` is assigned to one concrete execution
+attempt. Workers that declare ``attempt_lease_support`` during the
+``add_worker`` handshake receive an opaque ``attempt_id`` with the assignment
+and must include it in heartbeats and every subsequent status report. The
+scheduler rejects reports from revoked leases, even when the worker name has
+been re-registered, and records those reports as diagnostics instead of
+changing the task. ``get_attempt_diagnostics`` exposes those records. Replaying
+a current, already accepted terminal report is idempotent.
+
+Persisted scheduler state does not preserve live leases: loading a state file
+revokes them, and a worker name re-registering with a new ``client_id`` starts
+a fresh identity. Reports from the previous identity cannot complete the new
+attempt.
+
+Clients that do not declare lease support in the handshake are handled in
+``legacy`` mode and do not receive attempt tokens. The scheduler reports this
+mode explicitly in the handshake response; it never silently assumes that a
+legacy client is protected by leases.
+
 .. _TaskHistory:
 
 Enabling Task History
