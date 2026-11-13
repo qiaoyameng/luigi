@@ -86,6 +86,73 @@ class TaskException(Exception):
     pass
 
 
+class WorkerDrainError(TaskException):
+    """Raised when a new root task is submitted to a worker that is draining.
+
+    A draining worker keeps processing the work it already accepted (including
+    dynamic dependencies discovered by that work) but refuses brand new root
+    tasks.  Callers that want their task to run should schedule it on another
+    worker instead of retrying against the draining one.
+    """
+
+
+class DrainResult:
+    """Observable outcome of a :meth:`Worker.drain` call.
+
+    ``drained`` is the definitive answer callers wait for: it is ``True`` only
+    when the worker has stopped accepting new root work and every accepted task
+    has reached a terminal state.  A timeout never flips it to ``True``; in
+    that case ``drained`` stays ``False`` and the remaining counts describe the
+    work that is still in flight so the caller can decide what to do.
+    """
+
+    __slots__ = (
+        "worker_id",
+        "drained",
+        "timed_out",
+        "running_tasks",
+        "pending_tasks",
+        "unique_pending_tasks",
+        "failed_retry_tasks",
+        "completed_tasks",
+    )
+
+    def __init__(
+        self,
+        worker_id,
+        drained,
+        timed_out=False,
+        running_tasks=0,
+        pending_tasks=0,
+        unique_pending_tasks=0,
+        failed_retry_tasks=0,
+        completed_tasks=0,
+    ):
+        self.worker_id = worker_id
+        self.drained = drained
+        self.timed_out = timed_out
+        self.running_tasks = running_tasks
+        self.pending_tasks = pending_tasks
+        self.unique_pending_tasks = unique_pending_tasks
+        self.failed_retry_tasks = failed_retry_tasks
+        self.completed_tasks = completed_tasks
+
+    def __bool__(self):
+        return self.drained
+
+    def __eq__(self, other):
+        if not isinstance(other, DrainResult):
+            return NotImplemented
+        return all(getattr(self, attr) == getattr(other, attr) for attr in self.__slots__)
+
+    def __hash__(self):
+        return hash(tuple(getattr(self, attr) for attr in self.__slots__))
+
+    def __repr__(self):
+        fields = ", ".join("{}={!r}".format(attr, getattr(self, attr)) for attr in self.__slots__)
+        return "DrainResult({})".format(fields)
+
+
 GetWorkResponse = collections.namedtuple(
     "GetWorkResponse",
     (
@@ -570,6 +637,26 @@ class Worker:
         self._batch_running_tasks = {}
         self._batch_families_sent = set()
 
+        # Drain state. Draining means "no new root tasks, finish what we own".
+        # It is distinct from force-stopping (which terminates task processes).
+        self._drain_lock = threading.RLock()
+        self._draining = False
+        # Set once the worker has no accepted work left. The definitive signal
+        # drain() waiters block on; a timeout does not set it.
+        self._drain_complete = threading.Event()
+        self._drain_result = None
+        # Set once run() returns, so a drain requested afterwards can resolve
+        # immediately instead of waiting for a loop that will never run again.
+        self._run_finished = threading.Event()
+        # Set once run() actually starts its scheduling loop.  A drain must not
+        # be declared complete while the loop has never had a chance to pick up
+        # work that was scheduled before the drain was requested.
+        self._run_started = threading.Event()
+        # Accepted tasks currently parked as FAILED waiting out retry delays.
+        self._failed_retry_task_ids = set()
+        # Accepted tasks that reached DONE during this run.
+        self._completed_task_ids = set()
+
         self._first_task = None
 
         self.add_succeeded = True
@@ -771,9 +858,30 @@ class Worker:
 
     def add(self, task, multiprocess=False, processes=0):
         """
-        Add a Task for the worker to check and possibly schedule and run.
+        Add a root Task for the worker to check and possibly schedule and run.
 
         Returns True if task and its dependencies were successfully scheduled or completed before.
+
+        Once :meth:`drain` has been requested the worker no longer accepts new
+        root tasks and this raises :class:`WorkerDrainError`.  Dynamic
+        dependencies yielded by already accepted tasks and reschedules of work
+        the worker already owns keep flowing through the internal scheduling
+        path instead.
+        """
+        with self._drain_lock:
+            if self._draining:
+                raise WorkerDrainError(
+                    "Worker %s is draining and refuses the new root task %r. "
+                    "Only already accepted tasks and their dynamic dependencies are processed." % (self._id, task)
+                )
+        return self._schedule(task, multiprocess, processes)
+
+    def _schedule(self, task, multiprocess=False, processes=0):
+        """Internal scheduling path used by ``add`` and by accepted work.
+
+        Dynamic dependencies and missing-dependency reschedules of tasks the
+        worker already accepted call this directly, so they continue to be
+        scheduled while the worker is draining.
         """
         if self._first_task is None and hasattr(task, "task_id"):
             self._first_task = task.task_id
@@ -1112,7 +1220,9 @@ class Worker:
             if new_requirements:
                 new_req = [load_task(module, name, params) for module, name, params in new_requirements]
                 for t in new_req:
-                    self.add(t)
+                    # Dynamic dependencies of already accepted work are part of
+                    # the accepted scope, so bypass the drain guard in add().
+                    self._schedule(t)
                 new_deps = [t.task_id for t in new_req]
 
             self._add_task(
@@ -1130,6 +1240,13 @@ class Worker:
                 retry_policy_dict=_get_retry_policy_dict(task),
             )
 
+            if self._draining:
+                if status == DONE:
+                    self._completed_task_ids.add(task_id)
+                    self._failed_retry_task_ids.discard(task_id)
+                elif status == FAILED:
+                    self._failed_retry_task_ids.add(task_id)
+
             self._running_tasks.pop(task_id)
 
             # re-add task to reschedule missing dependencies
@@ -1142,7 +1259,9 @@ class Worker:
                     if self.unfulfilled_counts[task_id] > self._config.max_reschedules:
                         reschedule = False
                 if reschedule:
-                    self.add(task)
+                    # Rescheduling work the worker already accepted must still
+                    # happen while draining.
+                    self._schedule(task)
 
             self.run_succeeded &= (status == DONE) or (len(new_deps) > 0)
             return
@@ -1195,11 +1314,198 @@ class Worker:
 
     def _start_phasing_out(self):
         """
-        Go into a mode where we dont ask for more work and quit once existing
-        tasks are done.
+        SIGUSR1 phase-out: stop asking the scheduler for work altogether.
+
+        This is intentionally different from :meth:`drain`.  A phase-out stops
+        pulling *any* work (including already accepted pending tasks), while a
+        drain keeps processing everything the worker already accepted and only
+        refuses brand new root tasks.  It stays idempotent and never
+        force-stops an in-flight task.
         """
         self._config.keep_alive = False
         self._stop_requesting_work = True
+
+    @property
+    def is_draining(self):
+        """True once a drain has been requested."""
+        return self._draining
+
+    @property
+    def is_drained(self):
+        """True once the accepted work has fully drained."""
+        return self._drain_complete.is_set()
+
+    def drain(self, timeout=None):
+        """
+        Gracefully drain the worker instead of killing it.
+
+        Drain semantics:
+
+        * no new root tasks are accepted (``add`` raises
+          :class:`WorkerDrainError` while draining);
+        * tasks the worker already accepted keep running, including dynamic
+          dependencies they yield and the reschedules they require;
+        * the keep-alive thread keeps pinging the scheduler, so the worker is
+          not mistaken for a dead one while it empties;
+        * the call blocks (up to ``timeout`` seconds) until the accepted work
+          is finished and returns an observable :class:`DrainResult`.
+
+        The call is idempotent: requesting a drain repeatedly returns the same
+        drain and, once finished, the same result.  A timeout never claims the
+        worker is drained -- the returned result has ``drained=False`` and the
+        caller can wait again.  Force-stopping task processes remains a
+        separate action (``__exit__``/``terminate``) and is intentionally not
+        part of draining.
+
+        :param timeout: maximum seconds to wait for the drain to finish.
+            ``None`` waits indefinitely, ``0`` only flips the worker into
+            draining mode without blocking.
+        :returns: a :class:`DrainResult` describing the definitive outcome.
+
+        Note that ``drain`` only switches the mode and waits; it does not run
+        the scheduling loop itself.  Accepted work keeps making progress only
+        while :meth:`run` is executing, so the typical deployment flow is to
+        request ``drain`` and let the already running ``run`` loop empty the
+        worker, or start ``run`` (e.g. in another thread) before waiting.
+        """
+        with self._drain_lock:
+            if not self._draining:
+                logger.info("Worker %s requested to drain; no new root tasks will be accepted", self._id)
+                self._draining = True
+                self._config.keep_alive = False
+            if self._drain_result is not None:
+                return self._drain_result
+            # If run() has already returned there is no loop left to process
+            # anything; the drain is as complete as it can ever be.
+            if self._run_finished.is_set():
+                self._drain_result = self._snapshot_drain(drained=len(self._running_tasks) == 0)
+                self._drain_complete.set()
+                return self._drain_result
+
+        if timeout is not None and timeout <= 0:
+            # Non-blocking request: let run() drive the drain to completion.
+            return self._snapshot_drain(drained=self.is_drained, timed_out=not self.is_drained)
+
+        completed = self._wait_for_drain(timeout)
+        if completed:
+            with self._drain_lock:
+                if self._drain_result is None:
+                    self._drain_result = self._snapshot_drain(drained=True)
+                return self._drain_result
+
+        # A timeout must not be reported as a completed drain.
+        return self._snapshot_drain(drained=False, timed_out=True)
+
+    def _snapshot_drain(self, drained, timed_out=False):
+        """Build an observable snapshot of the remaining accepted work."""
+        running = len(self._running_tasks)
+        pending = unique_pending = 0
+        try:
+            counts = self._scheduler.count_pending(worker=self._id)
+            pending = counts.get("n_pending_tasks", 0)
+            unique_pending = counts.get("n_unique_pending", 0)
+        except Exception:
+            logger.warning("Worker %s could not query scheduler for drain counts", self._id)
+
+        failed_retry = self._waiting_retry_count()
+        # count_pending lumps PENDING and FAILED together.  A FAILED task that
+        # is still sleeping through its retry delay cannot be scheduled now, so
+        # it must not keep the drain open; expose it separately instead.
+        blocking_pending = max(0, pending - failed_retry)
+        completed = self._count_completed_tasks()
+        return DrainResult(
+            worker_id=self._id,
+            drained=drained,
+            timed_out=timed_out,
+            running_tasks=running,
+            pending_tasks=blocking_pending,
+            unique_pending_tasks=unique_pending,
+            failed_retry_tasks=failed_retry,
+            completed_tasks=completed,
+        )
+
+    def _pending_count(self):
+        """Tasks the scheduler still considers pending for this worker.
+
+        ``count_pending`` lumps PENDING and FAILED together, which is exactly
+        the "not yet terminal" view the drain loop needs.
+        """
+        try:
+            counts = self._scheduler.count_pending(worker=self._id)
+            return counts.get("n_pending_tasks", 0)
+        except Exception:
+            logger.warning("Worker %s could not query scheduler for pending counts", self._id)
+            return 0
+
+    def _prune_scheduler(self):
+        """Ask the scheduler to re-evaluate due retries.
+
+        A local scheduler only flips FAILED tasks back to PENDING while
+        pruning, and pruning is not guaranteed on every ``get_work``.  During
+        a drain we poll tightly, so trigger it explicitly to make sure a task
+        whose retry delay has elapsed becomes runnable promptly.  Remote
+        schedulers without a prune RPC simply skip this.
+        """
+        prune = getattr(self._scheduler, "prune", None)
+        if callable(prune):
+            try:
+                prune()
+            except Exception:
+                logger.warning("Worker %s failed to prune the scheduler while draining", self._id)
+
+    def _waiting_retry_count(self):
+        """Accepted FAILED tasks whose retry delay has not elapsed yet.
+
+        The local scheduler exposes task state directly.  For an opaque remote
+        scheduler we cannot distinguish a parked FAILED from a PENDING task, so
+        we conservatively report zero and let the normal pending view drive the
+        drain (a long-lived remote failure is surfaced via the scheduler).
+        """
+        state = getattr(self._scheduler, "_state", None)
+        if state is None:
+            return 0
+        now = time.time()
+        waiting = 0
+        for task_id in self._failed_retry_task_ids:
+            task = state.get_task(task_id)
+            if task is not None and task.status == FAILED and getattr(task, "retry", None) is not None and task.retry > now:
+                waiting += 1
+        return waiting
+
+    def _count_completed_tasks(self):
+        """Distinct accepted tasks that have reported DONE during this run."""
+        return len(self._completed_task_ids)
+
+    def _finish_drain(self):
+        """Record the definitive drain result and wake up every waiter."""
+        with self._drain_lock:
+            if self._drain_result is None:
+                self._drain_result = self._snapshot_drain(drained=True)
+            logger.info("Worker %s finished draining", self._id)
+            self._drain_complete.set()
+
+    def _wait_for_drain(self, timeout):
+        """Wait until run() has fully wound down after the drain completes.
+
+        ``_drain_complete`` fires as soon as no accepted work remains, but the
+        run loop still has to drain its result queue and return.  Waiting on
+        ``_run_finished`` guarantees callers never observe a half-stopped
+        worker (e.g. a context exit closing the queue under the run loop).
+        """
+        if timeout is None:
+            self._run_started.wait()
+            self._drain_complete.wait()
+            self._run_finished.wait()
+            return True
+        deadline = time.monotonic() + timeout
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self._run_started.wait(remaining):
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self._drain_complete.wait(remaining):
+            return False
+        remaining = deadline - time.monotonic()
+        return remaining > 0 and self._run_finished.wait(remaining)
 
     def run(self):
         """
@@ -1210,6 +1516,7 @@ class Worker:
         sleeper = self._sleeper()
         self.run_succeeded = True
 
+        self._run_started.set()
         self._add_worker()
 
         while True:
@@ -1227,7 +1534,21 @@ class Worker:
                     self._log_remote_tasks(get_work_response)
                 if len(self._running_tasks) == 0:
                     self._idle_since = self._idle_since or datetime.datetime.now()
-                    if self._keep_alive(get_work_response):
+                    if self._draining:
+                        self._prune_scheduler()
+                        # Keep polling while accepted work can still become
+                        # runnable (a PENDING task or a FAILED task whose retry
+                        # delay has elapsed).  Tasks parked on an unelapsed retry
+                        # delay are not runnable now and therefore do not keep
+                        # the drain open; they are reported in the result.
+                        if self._pending_count() > self._waiting_retry_count():
+                            next(sleeper)
+                            continue
+                        # No running tasks and no accepted work this worker can
+                        # run now. Finish the drain with a definitive result.
+                        self._finish_drain()
+                        break
+                    elif self._keep_alive(get_work_response):
                         next(sleeper)
                         continue
                     else:
@@ -1244,6 +1565,12 @@ class Worker:
             logger.debug("Shut down Worker, %d more tasks to go", len(self._running_tasks))
             self._handle_next_task()
 
+        if self._draining:
+            # Defensive: make sure waiters are always released even if the
+            # drain was requested after the normal run had nothing to do.
+            self._finish_drain()
+
+        self._run_finished.set()
         return self.run_succeeded
 
     def _handle_rpc_message(self, message):

@@ -18,6 +18,7 @@
 import email.parser
 import functools
 import logging
+import multiprocessing
 import os
 import shutil
 import signal
@@ -40,6 +41,21 @@ from luigi.scheduler import Scheduler
 from luigi.worker import Worker
 
 luigi.notifications.DEBUG = True
+
+
+def _multiprocessing_supported():
+    """Detect sandboxes where multiprocessing manager sockets cannot bind."""
+    manager = None
+    try:
+        manager = multiprocessing.Manager()
+        shared = manager.dict()
+        shared["ok"] = True
+        return shared["ok"] is True
+    except (EOFError, OSError):
+        return False
+    finally:
+        if manager is not None:
+            manager.shutdown()
 
 
 class DummyTask(Task):
@@ -1070,6 +1086,363 @@ class WorkerInterruptedTest(unittest.TestCase):
         t.start()
         t.join()
         self.assertTrue(task.complete())
+
+
+class WorkerDrainTest(LuigiTestCase):
+    """Behavior of the explicit, observable worker drain entry point."""
+
+    def setUp(self):
+        super(WorkerDrainTest, self).setUp()
+        self.sch = Scheduler(retry_delay=100, remove_delay=1000, worker_disconnect_delay=10)
+
+    def _worker(self, **kwargs):
+        kwargs.setdefault("scheduler", self.sch)
+        kwargs.setdefault("worker_id", "drainer")
+        kwargs.setdefault("wait_interval", 0.05)
+        kwargs.setdefault("wait_jitter", 0.0)
+        kwargs.setdefault("ping_interval", 0.05)
+        kwargs.setdefault("no_install_shutdown_handler", True)
+        return Worker(**kwargs)
+
+    def test_drain_finishes_accepted_task_and_refuses_new_root(self):
+        gate = threading.Event()
+        released = threading.Event()
+
+        class BlockingTask(DummyTask):
+            def run(self):
+                gate.set()
+                released.wait(5)
+                super(BlockingTask, self).run()
+
+        class LateTask(DummyTask):
+            pass
+
+        blocked = BlockingTask()
+        with self._worker() as worker:
+            worker.add(blocked)
+            runner = threading.Thread(target=worker.run)
+            runner.start()
+            self.assertTrue(gate.wait(5))
+
+            # Non-blocking drain flips the worker into draining mode while the
+            # accepted task is still in flight.
+            requested = worker.drain(timeout=0)
+            self.assertTrue(worker.is_draining)
+            self.assertFalse(requested.drained)
+            self.assertTrue(requested.timed_out)
+
+            # No new root task may enter the worker once draining.
+            with self.assertRaises(luigi.worker.WorkerDrainError):
+                worker.add(LateTask())
+
+            # A timeout must not be reported as a completed drain.
+            timed_out = worker.drain(timeout=0.1)
+            self.assertFalse(timed_out.drained)
+            self.assertTrue(timed_out.timed_out)
+            self.assertEqual(timed_out.running_tasks, 1)
+
+            # Repeated (idempotent) drain requests share the same outcome once
+            # the blocker is released.
+            released.set()
+            result = worker.drain(timeout=5)
+            runner.join(5)
+            self.assertFalse(runner.is_alive())
+            # All accepted work has released its execution resources: no task
+            # process/slot is still occupied by the drained worker.
+            self.assertEqual(worker._running_tasks, {})
+
+        self.assertTrue(result.drained)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.running_tasks, 0)
+        self.assertEqual(result.pending_tasks, 0)
+        self.assertTrue(blocked.complete())
+        # The rejected root task never ran.
+        self.assertFalse(LateTask().complete())
+
+    def test_accepted_task_runs_exactly_once_while_draining(self):
+        run_count = {"n": 0}
+
+        class CountedTask(Task):
+            def complete(self):
+                return run_count["n"] >= 1
+
+            def run(self):
+                run_count["n"] += 1
+
+        task = CountedTask()
+        with self._worker() as worker:
+            worker.add(task)
+            worker.drain(timeout=0)
+            run_success = worker.run()
+            drain_result = worker.drain(timeout=5)
+
+        self.assertTrue(run_success)
+        self.assertTrue(drain_result.drained)
+        self.assertEqual(run_count["n"], 1)
+        self.assertEqual(drain_result.completed_tasks, 1)
+
+    def test_repeated_drain_is_idempotent_and_returns_same_result(self):
+        class A(DummyTask):
+            pass
+
+        with self._worker() as worker:
+            worker.add(A())
+            first = worker.drain(timeout=0)
+            second = worker.drain(timeout=0)
+            self.assertFalse(first.drained)
+            self.assertFalse(second.drained)
+
+            worker.run()
+            finished_one = worker.drain(timeout=5)
+            finished_two = worker.drain(timeout=5)
+
+        self.assertTrue(finished_one.drained)
+        self.assertEqual(finished_one, finished_two)
+        self.assertIs(finished_one, finished_two)
+
+    def test_drain_keeps_heartbeating_so_scheduler_keeps_worker_active(self):
+        gate = threading.Event()
+        released = threading.Event()
+        pings = {"n": 0}
+
+        class HeartbeatScheduler(Scheduler):
+            def ping(self, **kwargs):
+                pings["n"] += 1
+                return super(HeartbeatScheduler, self).ping(**kwargs)
+
+        class SlowTask(DummyTask):
+            def run(self):
+                gate.set()
+                released.wait(5)
+                super(SlowTask, self).run()
+
+        scheduler = HeartbeatScheduler(retry_delay=100, remove_delay=1000, worker_disconnect_delay=10)
+        with self._worker(scheduler=scheduler) as worker:
+            worker.add(SlowTask())
+            runner = threading.Thread(target=worker.run)
+            runner.start()
+            self.assertTrue(gate.wait(5))
+            worker.drain(timeout=0)
+            time.sleep(0.3)
+            released.set()
+            result = worker.drain(timeout=5)
+            runner.join(5)
+
+        self.assertTrue(result.drained)
+        self.assertGreater(pings["n"], 1)
+        # The scheduler still considers the worker registered, not dead.
+        self.assertIn("drainer", scheduler._state.get_worker_ids())
+
+    def test_dynamic_dependencies_are_processed_while_draining(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+
+        with self._worker() as worker:
+            worker.add(DynamicRequires(tmp))
+            worker.drain(timeout=0)
+            result = worker.run()
+            drain_result = worker.drain(timeout=10)
+
+        self.assertTrue(result)
+        self.assertTrue(drain_result.drained)
+        parent = os.path.join(tmp, "parent")
+        self.assertTrue(os.path.exists(parent))
+        for i in range(7):
+            self.assertTrue(os.path.exists(os.path.join(tmp, str(i))))
+
+    def test_failed_task_retry_does_not_block_drain_and_is_reported(self):
+        # retry_delay=0 so the failed task is immediately schedulable again and
+        # gets retried to completion within the drain.
+        scheduler = Scheduler(retry_delay=0, remove_delay=1000, worker_disconnect_delay=10)
+        attempts = {"n": 0}
+
+        class FlakyTask(Task):
+            def complete(self):
+                return attempts["n"] >= 2
+
+            def run(self):
+                attempts["n"] += 1
+                if attempts["n"] < 2:
+                    raise RuntimeError("transient failure %d" % attempts["n"])
+
+        with self._worker(scheduler=scheduler) as worker:
+            worker.add(FlakyTask())
+            worker.drain(timeout=0)
+            worker.run()
+            result = worker.drain(timeout=5)
+
+        # The task failed once and then retried to success within the drain.
+        # run_succeeded stays False because Luigi records the earlier failure,
+        # but the drain itself completes deterministically with the task done.
+        self.assertTrue(FlakyTask().complete())
+        self.assertTrue(result.drained)
+        self.assertEqual(attempts["n"], 2)
+        self.assertEqual(result.pending_tasks, 0)
+        self.assertEqual(result.running_tasks, 0)
+
+    def test_failed_task_waiting_for_retry_is_reported_not_force_stopped(self):
+        # A long retry delay parks the failed task; the drain still completes
+        # deterministically and surfaces the parked task instead of hanging.
+        scheduler = Scheduler(retry_delay=10000, remove_delay=1000, worker_disconnect_delay=10)
+
+        class AlwaysFails(Task):
+            def complete(self):
+                return False
+
+            def run(self):
+                raise RuntimeError("permanent failure")
+
+        with self._worker(scheduler=scheduler) as worker:
+            worker.add(AlwaysFails())
+            worker.drain(timeout=0)
+            success = worker.run()
+            result = worker.drain(timeout=5)
+            # The task process is gone; nothing is running anymore.
+            self.assertEqual(worker._running_tasks, {})
+
+        self.assertFalse(success)
+        self.assertTrue(result.drained)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.failed_retry_tasks, 1)
+        self.assertEqual(result.running_tasks, 0)
+
+    def test_force_stop_is_separate_from_drain(self):
+        if not _multiprocessing_supported():
+            self.skipTest("multiprocessing sockets unavailable in this environment")
+
+        gate = threading.Event()
+        release = threading.Event()
+
+        class HungTask(DummyTask):
+            def run(self):
+                gate.set()
+                release.wait(10)
+
+        worker = self._worker(worker_processes=2, force_multiprocessing=True)
+        with worker:
+            worker.add(HungTask())
+            runner = threading.Thread(target=worker.run)
+            runner.start()
+            self.assertTrue(gate.wait(5))
+
+            # Drain must not terminate the in-flight task process.
+            worker.drain(timeout=0)
+            pending = worker.drain(timeout=0.2)
+            self.assertFalse(pending.drained)
+            self.assertEqual(pending.running_tasks, 1)
+            self.assertTrue(all(process.is_alive() for process in worker._running_tasks.values()))
+
+            release.set()
+            finished = worker.drain(timeout=5)
+            runner.join(5)
+
+        self.assertTrue(finished.drained)
+        self.assertEqual(finished.running_tasks, 0)
+
+    def test_drain_after_run_returns_deterministic_result(self):
+        class A(DummyTask):
+            pass
+
+        worker = self._worker()
+        with worker:
+            worker.add(A())
+            self.assertTrue(worker.run())
+            # Drain requested only after the run has already finished.
+            result = worker.drain(timeout=5)
+
+        self.assertTrue(result.drained)
+        self.assertFalse(result.timed_out)
+
+    def test_drain_timeout_without_run_returns_deterministic_answer(self):
+        class A(DummyTask):
+            pass
+
+        with self._worker() as worker:
+            worker.add(A())
+            # run() is never started; the wait must not hang and must not
+            # falsely report the worker as drained.
+            start = time.monotonic()
+            result = worker.drain(timeout=0.2)
+            elapsed = time.monotonic() - start
+
+        self.assertFalse(result.drained)
+        self.assertTrue(result.timed_out)
+        self.assertLess(elapsed, 2.0)
+        # The accepted task was never executed.
+        self.assertFalse(A().complete())
+
+    def test_drain_requested_before_run_still_processes_accepted_chain(self):
+        run_order = []
+
+        class Leaf(Task):
+            n = luigi.Parameter()
+
+            def complete(self):
+                return getattr(self, "_done", False)
+
+            def run(self):
+                run_order.append(str(self.n))
+                self._done = True
+
+        class ChainRoot(Task):
+            def requires(self):
+                return [Leaf(n=i) for i in range(3)]
+
+            def complete(self):
+                return all(Leaf(n=i).complete() for i in range(3))
+
+            def run(self):
+                run_order.append("root")
+
+        with self._worker() as worker:
+            worker.add(ChainRoot())
+            # Request the drain before the run loop has started at all.
+            requested = worker.drain(timeout=0)
+            self.assertFalse(requested.drained)
+            runner = threading.Thread(target=worker.run)
+            runner.start()
+            result = worker.drain(timeout=10)
+            runner.join(5)
+            self.assertFalse(runner.is_alive())
+
+        self.assertTrue(result.drained)
+        self.assertEqual(sorted(run_order), ["0", "1", "2", "root"])
+        self.assertEqual(result.pending_tasks, 0)
+        self.assertEqual(result.running_tasks, 0)
+
+    def test_multiple_drain_waiters_all_get_definitive_result(self):
+        gate = threading.Event()
+        released = threading.Event()
+
+        class SlowTask(DummyTask):
+            def run(self):
+                gate.set()
+                released.wait(5)
+                super(SlowTask, self).run()
+
+        results = []
+
+        def wait_for_drain(worker):
+            results.append(worker.drain(timeout=10))
+
+        with self._worker() as worker:
+            worker.add(SlowTask())
+            runner = threading.Thread(target=worker.run)
+            runner.start()
+            self.assertTrue(gate.wait(5))
+            worker.drain(timeout=0)
+            waiters = [threading.Thread(target=wait_for_drain, args=(worker,)) for _ in range(3)]
+            for waiter in waiters:
+                waiter.start()
+            time.sleep(0.2)
+            released.set()
+            for waiter in waiters:
+                waiter.join(5)
+                self.assertFalse(waiter.is_alive())
+            runner.join(5)
+
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(result.drained for result in results))
 
 
 class WorkerDisabledTest(LuigiTestCase):
