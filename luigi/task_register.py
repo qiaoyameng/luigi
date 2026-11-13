@@ -22,6 +22,8 @@ import abc
 import logging
 from typing import Any, Dict, List
 
+from luigi import canonical
+
 logger = logging.getLogger("luigi-interface")
 
 
@@ -89,13 +91,33 @@ class Register(abc.ABCMeta):
         params = cls.get_params()
         param_values = cls.get_param_values(params, args, kwargs)
 
-        k = (cls, tuple(param_values))
+        if canonical.canonical_identity_enabled():
+            # In canonical mode the cache key must follow the same rules as the
+            # task id: mapping insertion order and int/bool/str distinctions.
+            # Reusing the legacy (value based) key here would merge tasks whose
+            # FrozenOrderedDict hashes collide or whose 1/True/"1" values hash
+            # alike, so key on the canonical identity hash instead.
+            from luigi.parameter import ParameterVisibility
 
-        try:
-            hash(k)
-        except TypeError:
-            logger.debug("Not all parameter values are hashable so instance isn't coming from the cache")
-            return instantiate()  # unhashable types in parameters
+            params_by_name = dict(params)
+            identity_parts = [
+                (name, value)
+                for name, value in param_values
+                if params_by_name[name].significant and params_by_name[name].visibility != ParameterVisibility.PRIVATE
+            ]
+            try:
+                k = (cls, canonical.canonical_identity_hash(cls.get_task_family(), identity_parts))
+            except canonical.CanonicalEncodingError:
+                logger.debug("Parameter values cannot be canonically encoded so instance isn't coming from the cache")
+                return instantiate()
+        else:
+            k = (cls, tuple(param_values))
+
+            try:
+                hash(k)
+            except TypeError:
+                logger.debug("Not all parameter values are hashable so instance isn't coming from the cache")
+                return instantiate()  # unhashable types in parameters
 
         if k not in h:
             h[k] = instantiate()

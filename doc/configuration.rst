@@ -134,6 +134,14 @@ autoload_range
   using ``--module luigi.tools.range``. Defaults to true. Setting this to true
   explicitly disables the deprecation warning.
 
+canonical_task_identity
+  If true, task ids are generated from a canonical, order-independent and
+  type-preserving encoding of the significant parameter values. Canonical ids
+  carry a distinct ``-v2`` suffix and are never merged with legacy ids, so
+  existing scheduler state keeps working unchanged. Defaults to false. See
+  :ref:`canonical-task-identity` for the supported value types and timezone
+  conventions.
+
 default_scheduler_host
   Hostname of the machine running the scheduler. Defaults to localhost.
 

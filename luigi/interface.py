@@ -80,6 +80,16 @@ class core(task.Config):
     assistant = parameter.BoolParameter(default=False, description="Run any task from the scheduler.")
     help = parameter.BoolParameter(default=False, description="Show most common flags and all task-specific flags", always_in_help=True)
     help_all = parameter.BoolParameter(default=False, description="Show all command line flags", always_in_help=True)
+    canonical_task_identity = parameter.BoolParameter(
+        default=False,
+        config_path=dict(section="core", name="canonical_task_identity"),
+        description=(
+            "Generate task ids from a canonical, order-independent and "
+            "type-preserving encoding of the parameter values. Disabled by "
+            "default to preserve legacy task ids; canonical ids carry a "
+            "distinct -v2 suffix and are never merged with legacy ids."
+        ),
+    )
 
 
 class _WorkerSchedulerFactory:

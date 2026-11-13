@@ -9,8 +9,6 @@ try:
     from collections.abc import Mapping
 except ImportError:
     from collections import Mapping  # type: ignore
-import functools
-import operator
 
 
 class FrozenOrderedDict(Mapping):
@@ -38,8 +36,15 @@ class FrozenOrderedDict(Mapping):
 
     def __hash__(self):
         if self.__hash is None:
-            hashes = map(hash, self.items())
-            self.__hash = functools.reduce(operator.xor, hashes, 0)
+            # Two requirements have to hold at the same time:
+            #   * equality is order independent, so equal mappings must keep
+            #     equal hashes (Python's hash/eq invariant);
+            #   * the previous XOR-over-items implementation collapsed
+            #     unrelated mappings such as {"a": 1, "b": 2} and
+            #     {"a": 2, "b": 1} into the same hash, which made the task
+            #     instance cache return a task built from different arguments.
+            # Hash a canonical, key-sorted tuple of item hashes instead.
+            self.__hash = hash(tuple(sorted((hash(key), hash(value)) for key, value in self.items())))
 
         return self.__hash
 

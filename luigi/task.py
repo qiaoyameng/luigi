@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 from typing_extensions import dataclass_transform
 
 import luigi
+from luigi import canonical
 from luigi import configuration, parameter
 from luigi.parameter import ParameterVisibility, UnconsumedParameterWarning
 from luigi.task_register import Register
@@ -140,6 +141,48 @@ def task_id_str(task_family, params):
     param_summary = TASK_ID_INVALID_CHAR_REGEX.sub("_", param_summary)
 
     return "{}_{}_{}".format(task_family, param_summary, param_hash[:TASK_ID_TRUNCATE_HASH])
+
+
+def canonical_task_id_str(task_family, param_values):
+    """
+    Returns a canonical, order-independent and type-preserving task id.
+
+    :param task_family: The task family (class name) of the task
+    :param param_values: an iterable of ``(parameter_name, normalized_value)``
+                         tuples for the significant, non-private parameters
+    :return: a stable identifier of the form
+             ``<task_family>_<param_summary>_<sha256 prefix>-v2``
+
+    Unlike :func:`task_id_str`, the hash is computed from the actual
+    (normalized) parameter values instead of their string serialization, see
+    :mod:`luigi.canonical`.  The trailing ``-v2`` marker guarantees that a
+    canonical id can never be byte-identical to a legacy id, even for tasks
+    without parameters.
+    """
+    param_values = list(param_values)
+    identity_hash = canonical.canonical_identity_hash(
+        task_family,
+        ((name, value) for name, value in param_values),
+    )
+
+    # Keep the human readable prefix in sync with the legacy layout, but derive
+    # it from the same ordered, type-tagged encodings used for the hash.
+    summary_parts = []
+    for name, value in sorted(param_values, key=lambda item: item[0])[:TASK_ID_INCLUDE_PARAMS]:
+        summary_parts.append(
+            TASK_ID_INVALID_CHAR_REGEX.sub(
+                "_",
+                canonical.canonical_encoding(value)[:TASK_ID_TRUNCATE_PARAMS],
+            )
+        )
+    param_summary = "_".join(summary_parts)
+
+    return "{}_{}_{}-{}".format(
+        task_family,
+        param_summary,
+        identity_hash[:TASK_ID_TRUNCATE_HASH],
+        canonical.CANONICAL_IDENTITY_VERSION,
+    )
 
 
 class BulkCompleteNotImplementedError(NotImplementedError):
@@ -482,7 +525,11 @@ class Task(metaclass=Register):
         self.param_kwargs = dict(param_values)
 
         self._warn_on_wrong_param_types()
-        self.task_id = task_id_str(self.get_task_family(), self.to_str_params(only_significant=True, only_public=True))
+        self._canonical_identity = canonical.canonical_identity_enabled()
+        if self._canonical_identity:
+            self.task_id = canonical_task_id_str(self.get_task_family(), self._significant_param_values())
+        else:
+            self.task_id = task_id_str(self.get_task_family(), self.to_str_params(only_significant=True, only_public=True))
         self.__hash = hash(self.task_id)
 
         self.set_tracking_url = None
@@ -500,6 +547,25 @@ class Task(metaclass=Register):
         """
         return hasattr(self, "task_id")
 
+    def _significant_param_values(self):
+        """Yield ``(name, normalized_value)`` for the significant, non-private
+        parameters that participate in the task identity.
+
+        This is the canonical-mode counterpart of
+        ``to_str_params(only_significant=True, only_public=True)`` and applies
+        the exact same significance/visibility filtering.
+        """
+        params = dict(self.get_params())
+        for param_name, param_value in self.param_kwargs.items():
+            param_obj = params[param_name]
+            if param_obj.significant and param_obj.visibility != ParameterVisibility.PRIVATE:
+                yield param_name, param_value
+
+    @property
+    def canonical_identity(self):
+        """``True`` when this instance's id uses the canonical identity mode."""
+        return getattr(self, "_canonical_identity", False)
+
     def _warn_on_wrong_param_types(self):
         params = dict(self.get_params())
         for param_name, param_value in self.param_kwargs.items():
@@ -512,6 +578,8 @@ class Task(metaclass=Register):
 
         :param params_str: dict of param name -> value as string.
         """
+        if canonical.canonical_identity_enabled():
+            return cls._from_str_params_canonical(params_str)
         kwargs = {}
         for param_name, param in cls.get_params():
             if param_name in params_str:
@@ -521,6 +589,25 @@ class Task(metaclass=Register):
                 else:
                     kwargs[param_name] = param.parse(param_str)
 
+        return cls(**kwargs)
+
+    @classmethod
+    def _from_str_params_canonical(cls, params_str):
+        """Rebuild a task from serialized strings under canonical identity.
+
+        Every value is parsed through its parameter's ``parse`` hook and then
+        normalized exactly like a constructor argument, so the resulting native
+        values hash to the same canonical id as the originally scheduled task
+        -- including distinct handling of ``1``, ``True`` and ``"1"``.
+        """
+        kwargs = {}
+        for param_name, param in cls.get_params():
+            if param_name in params_str:
+                param_str = params_str[param_name]
+                if isinstance(param_str, list):
+                    kwargs[param_name] = param.normalize(param._parse_list(param_str))
+                else:
+                    kwargs[param_name] = param.normalize(param.parse(param_str))
         return cls(**kwargs)
 
     def to_str_params(self, only_significant=False, only_public=False):

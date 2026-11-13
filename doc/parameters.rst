@@ -85,8 +85,58 @@ are not the same instance:
     'bar'
     >>> c is d
     False
-    >>> hash(c) == hash(d)
-    True
+>>> hash(c) == hash(d)
+True
+
+.. _canonical-task-identity:
+
+Canonical task identity
+^^^^^^^^^^^^^^^^^^^^^^^
+
+By default Luigi builds a task id from the *serialized strings* of its
+significant parameters. Two caveats follow from that representation:
+
+* the serialized form of a :class:`~luigi.contrib` style dictionary parameter
+  preserves insertion order, so the same key/value pairs built in a different
+  order can yield different task ids;
+* values are flattened to strings before hashing, so distinct native values
+  such as ``1``, ``True`` and ``"1"`` collide when passed to an untyped
+  :class:`~luigi.parameter.Parameter`.
+
+Set ``canonical_task_identity`` in the ``[core]`` section (or pass
+``--canonical-task-identity`` on the command line) to opt into the canonical
+identity mode, which hashes the actual, normalized parameter values instead:
+
+.. code:: ini
+
+    [core]
+    canonical_task_identity: true
+
+In this mode:
+
+* mappings are compared by content, never by insertion order, including when
+  nested inside lists, tuples or other mappings;
+* every value carries an explicit type tag, so ``1``, ``True``, ``1.0`` and
+  ``"1"`` produce distinct task ids;
+* the supported value domain is closed: ``None``, ``bool``, ``int``,
+  ``float``, :class:`decimal.Decimal`, :class:`datetime.date`,
+  :class:`datetime.datetime`, :class:`datetime.timedelta`, ``str``,
+  :class:`enum.Enum`, ``list``/``tuple`` and mappings with string keys.
+  Unsupported objects and circular references raise
+  :class:`luigi.canonical.CanonicalEncodingError` instead of being coerced
+  through ``repr()``;
+* naive datetimes keep their wall-clock representation while timezone-aware
+  datetimes are converted to UTC (suffixed with ``Z``); the two conventions
+  never share an identity;
+* insignificant and private parameters still do not participate in the
+  identity.
+
+Canonical ids are suffixed with ``-v2`` so they can never be mistaken for a
+legacy id. The mode therefore stays opt-in and fully backward compatible:
+existing scheduler state keyed by legacy ids is not silently merged with
+canonical ids, and a task reconstructed through
+:meth:`~luigi.task.Task.from_str_params` rebuilds the same id it was scheduled
+with.
 
 Parameter visibility
 ^^^^^^^^^^^^^^^^^^^^

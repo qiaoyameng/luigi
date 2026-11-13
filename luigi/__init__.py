@@ -18,7 +18,7 @@
 Package containing core luigi functionality.
 """
 
-from luigi import configuration, event, interface, local_target, parameter, rpc, target, task
+from luigi import canonical, configuration, event, interface, local_target, parameter, rpc, target, task
 from luigi.__version__ import VERSION
 from luigi.event import Event
 from luigi.execution_summary import LuigiStatusCode
