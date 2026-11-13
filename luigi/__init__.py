@@ -18,12 +18,13 @@
 Package containing core luigi functionality.
 """
 
-from luigi import configuration, event, interface, local_target, parameter, rpc, target, task
+from luigi import configuration, event, interface, local_output_group, local_target, parameter, rpc, target, task
 from luigi.__version__ import VERSION
 from luigi.event import Event
 from luigi.execution_summary import LuigiStatusCode
 from luigi.interface import build, run
 from luigi.local_target import LocalTarget
+from luigi.local_output_group import LocalOutputGroup
 from luigi.parameter import (
     BoolParameter,
     ChoiceListParameter,
@@ -87,6 +88,7 @@ __all__ = [
     "task_register",
     "Target",
     "LocalTarget",
+    "LocalOutputGroup",
     "rpc",
     "RemoteScheduler",
     "RPCError",
@@ -114,6 +116,7 @@ __all__ = [
     "configuration",
     "interface",
     "local_target",
+    "local_output_group",
     "run",
     "build",
     "event",
